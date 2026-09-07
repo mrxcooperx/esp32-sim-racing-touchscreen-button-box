@@ -29,6 +29,7 @@ static LGFX lcd;
 
 uint16_t BG_COLOR = TFT_BLACK;   // mutable - this is what flag updates change
 bool showCheckerPattern = false; // used by drawAllButtons() below
+bool showStripePattern = false;  // yellow/red debris flag pattern
 
 struct ButtonDef {
   const char* code;   // "" or nullptr = placeholder, sends nothing when tapped
@@ -250,14 +251,63 @@ void drawCheckerboard() {
   }
 }
 
+void drawStripes() {
+  // Yellow/red vertical stripes - the "debris on track" surface flag
+  const int stripeW = 40;
+  int cols = lcd.width() / stripeW + 1;
+  for (int c = 0; c < cols; c++) {
+    uint16_t color = (c % 2 == 0) ? TFT_YELLOW : TFT_RED;
+    lcd.fillRect(c * stripeW, 0, stripeW, lcd.height(), color);
+  }
+}
+
+// ---------- Best lap time display (page 1 / blank flag page only) ----------
+// PC sends "LAPTIME:<seconds>" whenever your best lap changes.
+String currentLapTimeStr = "--:--.---";
+
+String formatLapTime(float totalSeconds) {
+  if (totalSeconds <= 0) return "--:--.---";
+  int minutes = (int)(totalSeconds / 60.0f);
+  float secs = totalSeconds - (minutes * 60.0f);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d:%06.3f", minutes, secs);
+  return String(buf);
+}
+
+// Draws text with a black outline so it stays readable over ANY
+// background - solid color, checkerboard, or stripes alike.
+void drawOutlinedText(const String &text, int x, int y, int textSize) {
+  lcd.setTextDatum(lgfx::middle_center);
+  lcd.setTextSize(textSize);
+  lcd.setTextColor(TFT_BLACK);
+  const int off = 2;
+  lcd.drawString(text, x - off, y);
+  lcd.drawString(text, x + off, y);
+  lcd.drawString(text, x, y - off);
+  lcd.drawString(text, x, y + off);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString(text, x, y);
+}
+
+void drawLapTimeDisplay() {
+  int cx = SCREEN_W / 2;
+  drawOutlinedText("BEST LAP", cx, 95, 2);
+  drawOutlinedText(currentLapTimeStr, cx, 135, 4);
+}
+
 void drawAllButtons() {
   if (showCheckerPattern) {
     drawCheckerboard();
+  } else if (showStripePattern) {
+    drawStripes();
   } else {
     lcd.fillScreen(BG_COLOR);
   }
   for (int i = 0; i < pageCounts[currentPage]; i++) {
     drawButton(i, false);
+  }
+  if (currentPage == 0) {
+    drawLapTimeDisplay();
   }
   drawSlider();
 }
@@ -338,6 +388,12 @@ void finishSliderDrag() {
   }
 }
 
+// ---------- Hidden easter egg ----------
+// Send the exact text "TestAll:PARTY" over serial (no button for this
+// on purpose) to run a quick flash-through of every flag color and
+// pattern - see the non-blocking startParty()/updateParty() system
+// further down, which does the actual work.
+
 // ---------- Flag color handling ----------
 // PC sends lines like "FLAG:GREEN" over the same serial connection.
 // On any actual color change, we flash a few times, then settle solid.
@@ -350,6 +406,18 @@ unsigned long lastFlashToggle = 0;
 const unsigned long FLASH_INTERVAL_MS = 150;
 const int FLASH_COUNT = 6;
 
+// ---------- Party mode easter egg ----------
+// Send "TestAll:PARTY" to rapid-fire through every flag color/pattern
+// as a fun quick self-test, then automatically restore whatever the
+// real flag was showing before it started.
+bool partyMode = false;
+int partyIndex = 0;
+unsigned long lastPartyStep = 0;
+const unsigned long PARTY_STEP_MS = 220;
+const char* PARTY_SEQUENCE[] = {"GREEN", "YELLOW", "RED", "BLUE", "WHITE", "BLACK", "CHECKERED", "DEBRIS"};
+const int PARTY_SEQUENCE_LEN = 8;
+String flagBeforeParty = "NONE";
+
 uint16_t colorForFlagName(const String &name) {
   if (name == "GREEN")     return TFT_GREEN;
   if (name == "YELLOW")    return TFT_YELLOW;
@@ -358,10 +426,54 @@ uint16_t colorForFlagName(const String &name) {
   if (name == "WHITE")     return TFT_WHITE;
   if (name == "BLACK")     return 0x39C7;
   if (name == "CHECKERED") return TFT_WHITE;
+  if (name == "DEBRIS")    return TFT_YELLOW;
   return TFT_BLACK; // "NONE"
 }
 
+void applyPartyFrame() {
+  String name = PARTY_SEQUENCE[partyIndex];
+  currentFlagColor = colorForFlagName(name);
+  currentFlagName = name;
+  BG_COLOR = currentFlagColor;
+  showCheckerPattern = (name == "CHECKERED");
+  showStripePattern = (name == "DEBRIS");
+  drawAllButtons();
+}
+
+void startParty() {
+  flagBeforeParty = currentFlagName;
+  flashing = false; // cancel any in-progress flash so it can't fight with party mode
+  partyMode = true;
+  partyIndex = 0;
+  lastPartyStep = millis();
+  applyPartyFrame();
+}
+
+void updateParty() {
+  unsigned long now = millis();
+  if (now - lastPartyStep < PARTY_STEP_MS) return;
+  lastPartyStep = now;
+  partyIndex++;
+
+  if (partyIndex >= PARTY_SEQUENCE_LEN) {
+    // Done - restore whatever flag was actually showing before party mode
+    partyMode = false;
+    currentFlagColor = colorForFlagName(flagBeforeParty);
+    currentFlagName = flagBeforeParty;
+    BG_COLOR = currentFlagColor;
+    showCheckerPattern = (flagBeforeParty == "CHECKERED");
+    showStripePattern = (flagBeforeParty == "DEBRIS");
+    drawAllButtons();
+    return;
+  }
+  applyPartyFrame();
+}
+
 void handleIncomingLine(const String &line) {
+  if (line == "TestAll:PARTY") {
+    startParty();
+    return;
+  }
   if (line.startsWith("FLAG:")) {
     String name = line.substring(5);
     uint16_t newColor = colorForFlagName(name);
@@ -370,10 +482,17 @@ void handleIncomingLine(const String &line) {
       currentFlagName = name;
       BG_COLOR = TFT_BLACK;
       showCheckerPattern = false;
+      showStripePattern = false;
       flashing = true;
       flashOn = false;
       flashesLeft = FLASH_COUNT;
       lastFlashToggle = millis();
+      drawAllButtons();
+    }
+  } else if (line.startsWith("LAPTIME:")) {
+    float t = line.substring(8).toFloat();
+    currentLapTimeStr = formatLapTime(t);
+    if (currentPage == 0) {
       drawAllButtons();
     }
   }
@@ -388,6 +507,7 @@ void updateFlash() {
   flashOn = !flashOn;
   BG_COLOR = flashOn ? currentFlagColor : TFT_BLACK;
   showCheckerPattern = flashOn && (currentFlagName == "CHECKERED");
+  showStripePattern = flashOn && (currentFlagName == "DEBRIS");
   drawAllButtons();
 
   if (!flashOn) {
@@ -396,6 +516,7 @@ void updateFlash() {
       flashing = false;
       BG_COLOR = currentFlagColor;
       showCheckerPattern = (currentFlagName == "CHECKERED");
+      showStripePattern = (currentFlagName == "DEBRIS");
       drawAllButtons();
     }
   }
@@ -424,7 +545,11 @@ void loop() {
       handleIncomingLine(line);
     }
   }
-  updateFlash();
+  if (partyMode) {
+    updateParty();
+  } else {
+    updateFlash();
+  }
 
   int32_t x, y;
   bool touchedNow = lcd.getTouch(&x, &y);

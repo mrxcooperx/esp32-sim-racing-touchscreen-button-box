@@ -96,7 +96,7 @@ DEFAULT_MAPPING = {
 FLAG_COLORS = {
     "NONE": "#333333", "GREEN": "#2ecc71", "YELLOW": "#f1c40f",
     "RED": "#e74c3c", "WHITE": "#ecf0f1", "BLACK": "#111111",
-    "CHECKERED": "#ffffff",
+    "CHECKERED": "#ffffff", "BLUE": "#3498db", "DEBRIS": "#f1c40f",
 }
 
 # ---------------------------------------------------------------
@@ -161,6 +161,14 @@ def text_color_for(hex_bg):
     return "#000000" if luminance > 150 else "#ffffff"
 
 
+def format_lap_time(total_seconds):
+    if total_seconds is None or total_seconds <= 0:
+        return "--:--.---"
+    minutes = int(total_seconds // 60)
+    secs = total_seconds - minutes * 60
+    return f"{minutes}:{secs:06.3f}"
+
+
 def load_mapping():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -195,6 +203,8 @@ def current_flag_name(ir):
         return "RED"
     if flags & (flag_bit("caution") | flag_bit("cautionWaving") | flag_bit("yellow") | flag_bit("yellowWaving")):
         return "YELLOW"
+    if flags & flag_bit("debris"):
+        return "DEBRIS"
     if flags & flag_bit("blue"):
         return "BLUE"
     if flags & flag_bit("white"):
@@ -222,6 +232,7 @@ class Backend:
         self.last_flag = None
         self.last_flag_check = 0.0
         self.last_fuel_pct = None
+        self.last_best_lap = None
 
     def log(self, msg):
         self.q.put(("log", msg))
@@ -314,9 +325,20 @@ class Backend:
                         if pct != self.last_fuel_pct:
                             self.last_fuel_pct = pct
                             self.q.put(("fuel", pct))
+
+                    best_lap = self.ir["LapBestLapTime"]
+                    if best_lap is not None and best_lap != self.last_best_lap:
+                        self.last_best_lap = best_lap
+                        self.log(f"Best lap: {best_lap:.3f}s")
+                        self.q.put(("laptime", best_lap))
+                        self._send_to_all(f"LAPTIME:{best_lap}\n")
                 elif self.last_fuel_pct is not None:
                     self.last_fuel_pct = None
                     self.q.put(("fuel", None))
+                    if self.last_best_lap is not None:
+                        self.last_best_lap = None
+                        self.q.put(("laptime", None))
+                        self._send_to_all("LAPTIME:-1\n")
 
             with self.connections_lock:
                 have_connections = bool(self.connections)
@@ -351,20 +373,28 @@ class Backend:
             if btn is None:
                 self.log(f"({port}) No mapping for '{code}'")
             else:
-                self.j.set_button(btn, 1)
-                self.q.put(("press", code, btn))
+                try:
+                    self.j.set_button(btn, 1)
+                    self.q.put(("press", port, code, btn))
+                except Exception as e:
+                    self.log(f"vJoy error on button {btn} ('{code}'): {e} - "
+                              f"is vJoy Device 1 configured with at least {btn} buttons?")
         elif line.startswith("RELEASE:"):
             code = line[len("RELEASE:"):]
             btn = self.get_button(code)
             if btn is None:
                 self.log(f"({port}) No mapping for '{code}'")
             else:
-                self.j.set_button(btn, 0)
-                self.q.put(("release", code, btn))
+                try:
+                    self.j.set_button(btn, 0)
+                    self.q.put(("release", port, code, btn))
+                except Exception as e:
+                    self.log(f"vJoy error on button {btn} ('{code}'): {e} - "
+                              f"is vJoy Device 1 configured with at least {btn} buttons?")
         elif line.startswith("PAGE:"):
             try:
                 page_num = int(line[len("PAGE:"):])
-                self.q.put(("page", page_num))
+                self.q.put(("page", port, page_num))
             except ValueError:
                 pass
         elif not line.startswith("FLAG:") and "ready" not in line.lower():
@@ -378,16 +408,17 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Button Box Control Panel")
-        self.geometry("1060x620")
+        self.geometry("1400x650")
 
         self.mapping_lock = threading.Lock()
         self.mapping = load_mapping()
         self.event_queue = queue.Queue()
 
         # Preview state
-        self.preview_page = 0
-        self.preview_pressed_code = None
-        self.preview_flag = "NONE"
+        self.preview_flag = "NONE"       # shared - same flag broadcasts to every board
+        self.best_lap_str = "--:--.---"  # shared - same telemetry value for every board
+        self.board_previews = {}         # port -> {"page": int, "pressed_code": str|None}
+        self.preview_widgets = {}        # port -> {"frame", "canvas", "page_label"}
         self.PREVIEW_SCALE = 1.0  # true size - matches the real 320x240 screen exactly
         self._icon_cache = {}   # (name, size) -> ImageTk.PhotoImage
         self._base_icons = {name: Image.open(io.BytesIO(base64.b64decode(b64)))
@@ -462,31 +493,24 @@ class App(tk.Tk):
         notebook = ttk.Notebook(container)
         notebook.grid(row=0, column=0, sticky="nsew")
 
-        # ---------------- Persistent Display Preview panel ----------------
+        # ---------------- Persistent Display Preview panels ----------------
         # Lives outside the notebook entirely, top-right, so it stays put
         # no matter which tab (Status / Button Mappings) is selected.
-        preview_panel = ttk.Frame(container, relief="groove", borderwidth=2)
-        preview_panel.grid(row=0, column=1, sticky="n", padx=10, pady=10)
+        # One independent sub-panel per connected board.
+        preview_outer = ttk.Frame(container)
+        preview_outer.grid(row=0, column=1, sticky="n", padx=10, pady=10)
 
-        ttk.Label(preview_panel, text="Display Preview", font=("", 11, "bold")).pack(
-            anchor="w", padx=8, pady=(8, 0)
-        )
+        ttk.Label(preview_outer, text="Display Preview", font=("", 11, "bold")).pack(anchor="w")
         ttk.Label(
-            preview_panel,
-            text="Schematic - shapes/icons, not pixel-perfect. Updates live.",
+            preview_outer,
+            text="Schematic - shapes/icons, not pixel-perfect. One panel per connected board.",
             wraplength=300, justify="left", font=("", 8),
-        ).pack(anchor="w", padx=8, pady=(0, 5))
+        ).pack(anchor="w", pady=(0, 8))
 
-        self.preview_page_label = ttk.Label(preview_panel, text="Page: -", font=("", 10, "bold"))
-        self.preview_page_label.pack(anchor="w", padx=8, pady=(0, 5))
+        self.preview_panels_row = ttk.Frame(preview_outer)
+        self.preview_panels_row.pack(anchor="n")
 
-        canvas_w = int(SCREEN_W * self.PREVIEW_SCALE)
-        canvas_h = int(SCREEN_H * self.PREVIEW_SCALE)
-        self.preview_canvas = tk.Canvas(preview_panel, width=canvas_w, height=canvas_h,
-                                         bg="#000000", highlightthickness=1, highlightbackground="#555")
-        self.preview_canvas.pack(padx=8, pady=(0, 8))
-
-        self._draw_preview()
+        self._rebuild_preview_panels([])  # populated once boards connect
 
         # ---------------- Status tab ----------------
         status_tab = ttk.Frame(notebook)
@@ -536,7 +560,7 @@ class App(tk.Tk):
         )
         flag_btn_frame = ttk.Frame(status_tab)
         flag_btn_frame.pack(anchor="w", padx=10, pady=(0, 10))
-        for name in ["GREEN", "YELLOW", "RED", "BLUE", "WHITE", "BLACK", "CHECKERED", "NONE"]:
+        for name in ["GREEN", "YELLOW", "RED", "BLUE", "DEBRIS", "WHITE", "BLACK", "CHECKERED", "NONE"]:
             ttk.Button(
                 flag_btn_frame, text=name, width=10,
                 command=lambda n=name: self.backend.trigger_flag(n),
@@ -588,8 +612,62 @@ class App(tk.Tk):
         ttk.Button(add_frame, text="Delete Selected", command=self._delete_mapping).pack(side="left", padx=5)
         ttk.Button(add_frame, text="Save", command=self._save_mappings).pack(side="right", padx=5)
 
-    def _draw_preview(self):
-        c = self.preview_canvas
+    def _draw_outlined_text(self, canvas, text, x, y, font_size):
+        # Black outline so text stays readable over any background,
+        # including the checkered/striped patterns - same trick the
+        # firmware uses for the same reason.
+        off = 2
+        for dx, dy in [(-off, 0), (off, 0), (0, -off), (0, off)]:
+            canvas.create_text(x + dx, y + dy, text=text, fill="#000000",
+                                font=("", font_size, "bold"), justify="center")
+        canvas.create_text(x, y, text=text, fill="#ffffff",
+                            font=("", font_size, "bold"), justify="center")
+
+    def _add_preview_panel(self, port):
+        self.board_previews[port] = {"page": 0, "pressed_code": None}
+
+        frame = ttk.Frame(self.preview_panels_row, relief="groove", borderwidth=2)
+        frame.pack(side="left", padx=(0, 8), pady=(0, 8))
+
+        ttk.Label(frame, text=port, font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(8, 0))
+        page_label = ttk.Label(frame, text="Page: -", font=("", 9))
+        page_label.pack(anchor="w", padx=8, pady=(0, 5))
+
+        canvas_w = int(SCREEN_W * self.PREVIEW_SCALE)
+        canvas_h = int(SCREEN_H * self.PREVIEW_SCALE)
+        canvas = tk.Canvas(frame, width=canvas_w, height=canvas_h,
+                            bg="#000000", highlightthickness=1, highlightbackground="#555")
+        canvas.pack(padx=8, pady=(0, 8))
+
+        self.preview_widgets[port] = {"frame": frame, "canvas": canvas, "page_label": page_label}
+        self._draw_preview_for_port(port)
+
+    def _rebuild_preview_panels(self, ports):
+        # Drop panels for boards that disconnected
+        for port in list(self.preview_widgets.keys()):
+            if port not in ports:
+                self.preview_widgets[port]["frame"].destroy()
+                del self.preview_widgets[port]
+                self.board_previews.pop(port, None)
+        # Add panels for newly-connected boards (existing ones are left
+        # alone so their current page/press state isn't disturbed)
+        for port in ports:
+            if port not in self.preview_widgets:
+                self._add_preview_panel(port)
+
+    def _draw_all_previews(self):
+        for port in list(self.preview_widgets.keys()):
+            self._draw_preview_for_port(port)
+
+    def _draw_preview_for_port(self, port):
+        widgets = self.preview_widgets.get(port)
+        if widgets is None:
+            return
+        state = self.board_previews.get(port, {"page": 0, "pressed_code": None})
+        page = state["page"]
+        pressed_code = state["pressed_code"]
+
+        c = widgets["canvas"]
         c.delete("all")
         s = self.PREVIEW_SCALE
 
@@ -603,13 +681,19 @@ class App(tk.Tk):
                 for col in range(cols):
                     color = "#ffffff" if (r + col) % 2 == 0 else "#000000"
                     c.create_rectangle(col * sq, r * sq, (col + 1) * sq, (r + 1) * sq, fill=color, outline="")
+        elif self.preview_flag == "DEBRIS":
+            stripe_w = int(40 * s)
+            cols = int(SCREEN_W * s / stripe_w) + 1
+            for col in range(cols):
+                color = "#f1c40f" if col % 2 == 0 else "#e74c3c"
+                c.create_rectangle(col * stripe_w, 0, (col + 1) * stripe_w, SCREEN_H * s, fill=color, outline="")
         else:
             c.create_rectangle(0, 0, SCREEN_W * s, SCREEN_H * s, fill=bg_hex, outline="")
 
-        # Checkered is a busy black/white pattern - plain black or white
-        # text disappears into it either way, so use a distinct accent
-        # color there instead of the normal luminance-based choice.
-        if self.preview_flag == "CHECKERED":
+        # Checkered/debris are busy multi-color patterns - plain
+        # luminance-based text color would disappear into half of it,
+        # so use a distinct accent color for both instead.
+        if self.preview_flag in ("CHECKERED", "DEBRIS"):
             text_color = "#3498db"
             outline_color = "#3498db"
         else:
@@ -621,16 +705,16 @@ class App(tk.Tk):
             SLIDER_X * s, 0, (SLIDER_X + SLIDER_W) * s + 6, SCREEN_H * s,
             fill="", outline="#888888", dash=(3, 2),
         )
-        handle_y = handle_y_for_page(self.preview_page)
+        handle_y = handle_y_for_page(page)
         c.create_rectangle(
             (SLIDER_X + 2) * s, handle_y * s,
             (SLIDER_X + SLIDER_W - 2) * s, (handle_y + HANDLE_H) * s,
             fill="#3498db", outline="",
         )
 
-        for btn in PAGES_LAYOUT[self.preview_page]:
+        for btn in PAGES_LAYOUT[page]:
             x, y, w, h = btn["x"] * s, btn["y"] * s, btn["w"] * s, btn["h"] * s
-            pressed = (btn["code"] == self.preview_pressed_code)
+            pressed = (btn["code"] == pressed_code)
             fill = "#e67e22" if pressed else btn.get("fill", "")
             outline = "" if fill else outline_color
 
@@ -660,8 +744,12 @@ class App(tk.Tk):
                     font=("", 13, "bold"), justify="center",
                 )
 
-        page_name = PAGE_NAMES[self.preview_page] if self.preview_page < len(PAGE_NAMES) else "?"
-        self.preview_page_label.configure(text=f"Page {self.preview_page + 1} of {NUM_PAGES}: {page_name}")
+        if page == 0:
+            self._draw_outlined_text(c, "BEST LAP", SCREEN_W * s / 2, 95 * s, 12)
+            self._draw_outlined_text(c, self.best_lap_str, SCREEN_W * s / 2, 135 * s, 24)
+
+        page_name = PAGE_NAMES[page] if page < len(PAGE_NAMES) else "?"
+        widgets["page_label"].configure(text=f"Page {page + 1} of {NUM_PAGES}: {page_name}")
 
     def _get_icon_rgba(self, name, size):
         """Icon with real alpha transparency, for drawing on the preview Canvas."""
@@ -795,26 +883,34 @@ class App(tk.Tk):
                 elif kind == "boards":
                     ports = item[1]
                     self.boards_label.configure(text=", ".join(ports) if ports else "none yet")
+                    self._rebuild_preview_panels(ports)
                 elif kind == "flag":
                     flag = item[1]
                     self.flag_swatch.itemconfig(self.flag_rect, fill=FLAG_COLORS.get(flag, "#333333"))
                     self.flag_text.configure(text=flag)
                     self.preview_flag = flag
-                    self._draw_preview()
+                    self._draw_all_previews()
                 elif kind == "page":
-                    self.preview_page = item[1]
-                    self._draw_preview()
+                    port, page_num = item[1], item[2]
+                    if port in self.board_previews:
+                        self.board_previews[port]["page"] = page_num
+                        self._draw_preview_for_port(port)
                 elif kind == "fuel":
                     self._update_fuel_gauge(item[1])
+                elif kind == "laptime":
+                    self.best_lap_str = format_lap_time(item[1])
+                    self._draw_all_previews()
                 elif kind in ("press", "release"):
-                    code, btn = item[1], item[2]
+                    port, code, btn = item[1], item[2], item[3]
                     verb = "PRESS" if kind == "press" else "RELEASE"
-                    self.last_button_label.configure(text=f"{verb} {code}  (vJoy #{btn})")
-                    self._append_log(f"{verb} {code} -> vJoy button {btn}")
-                    self.preview_pressed_code = code if kind == "press" else (
-                        None if self.preview_pressed_code == code else self.preview_pressed_code
-                    )
-                    self._draw_preview()
+                    self.last_button_label.configure(text=f"{verb} {code}  (vJoy #{btn})  [{port}]")
+                    self._append_log(f"({port}) {verb} {code} -> vJoy button {btn}")
+                    if port in self.board_previews:
+                        state = self.board_previews[port]
+                        state["pressed_code"] = code if kind == "press" else (
+                            None if state["pressed_code"] == code else state["pressed_code"]
+                        )
+                        self._draw_preview_for_port(port)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -845,18 +941,29 @@ class App(tk.Tk):
         self.withdraw()
 
     def _quit_app(self):
+        # vJoy button states persist in the driver even after this process
+        # exits - release everything explicitly so nothing gets left
+        # stuck "held down" if you quit mid-press.
+        if self.backend.j is not None:
+            with self.mapping_lock:
+                button_nums = list(self.mapping.values())
+            for btn in button_nums:
+                try:
+                    self.backend.j.set_button(btn, 0)
+                except Exception:
+                    pass
+
         self.backend.stop()
         if self.tray_icon is not None:
             self.tray_icon.stop()
         self.destroy()
 
     def _on_close(self):
-        if PYSTRAY_AVAILABLE:
-            # Minimize to tray instead of quitting - use the tray menu's
-            # Quit option (or Ctrl+C in a console) to actually exit.
-            self._hide_window()
-        else:
-            self._quit_app()
+        # X always fully quits and disconnects everything - minimizing the
+        # window (the normal OS minimize button) is what keeps it running
+        # in the background during gameplay. "Hide to Tray" in the tray
+        # menu is still available as a manual option if you want that too.
+        self._quit_app()
 
 
 if __name__ == "__main__":
