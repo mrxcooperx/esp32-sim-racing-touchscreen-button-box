@@ -1,6 +1,10 @@
-#ADD STL TO BAMBU
-#ADD README TO GITHUB
-#UPDATE FILES TO GITHUB
+The controller will add another controller to your PC using vJoy. 
+You need vJoy downloaded and setup to take a min of 40 buttons. This avoids conflicts if we add buttons in the future
+
+
+arduino ide to flash the esp32 
+.ino file and .h file need to be in the same folder. ex . Project/Project.ino, icon.h file
+
 
 
 2.8 " TouchScreen Setup
@@ -12,8 +16,7 @@ esp32 touchscreen 2.8"
 software needed 
 Python
 vJoy
-arduino ide to flash the esp32 
-.ino file and .h file need to be in the same folder. ex . Project/Project.ino, icon.h file
+
 
 
 python scripts
