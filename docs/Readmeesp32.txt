@@ -23,3 +23,10 @@ python scripts
 -noconsolescreeninput
 -guiconsole , each unit that gets plugged in will show up as another device #to test functions run TestAll:PARTY
 
+
+
+
+my todo llist
+#add screenshots of each page 
+#vjoy screenshots 
+#links to apps needed 

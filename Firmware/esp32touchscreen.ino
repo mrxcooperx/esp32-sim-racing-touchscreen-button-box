@@ -3,11 +3,11 @@
   Board: Elegoo/Sunton "Cheap Yellow Display" - ESP32-2432S028R
 
   3 pages of buttons, a blank flag page, and an adjuster page,
-  switched with a vertical slider on the left edge:
+  switched with a stack of tap-to-select buttons on the left edge:
     Page 1: blank - just shows the current flag color, nothing else
-    Page 2: D-pad plus a small red circle center button
-    Page 3: Reset, Tortoise, Wheel Repair, Battery
-    Page 4: 2x fuel can + 4x tire (LF/RF/RR/LR)
+    Page 2: Reset, Tortoise, Wheel Repair, Battery
+    Page 3: 2x fuel can + 4x tire (LF/RF/RR/LR)
+    Page 4: D-pad plus a small red circle center button
     Page 5: 3 up/down adjuster pairs (placeholder codes ADJ1/2/3)
 
   Sends "PRESS:<code>" the instant a button is touched, and
@@ -62,35 +62,7 @@ void buildLayout() {
   // =========================================================
 
   // =========================================================
-  // PAGE 2: D-pad, big, using the full content area, plus a
-  // small red circle "OK" button in the middle cell.
-  // =========================================================
-  {
-    const int cellW = CONTENT_W / 3;
-    const int cellH = CONTENT_H / 3;
-    int idx = 0;
-    pages[1][idx++] = { "UP",    nullptr, CONTENT_X + 1*cellW, CONTENT_Y + 0*cellH, cellW, cellH, ICON_ARROW_UP,    ICON_ARROW_UP_W,    ICON_ARROW_UP_H };
-    pages[1][idx++] = { "LEFT",  nullptr, CONTENT_X + 0*cellW, CONTENT_Y + 1*cellH, cellW, cellH, ICON_ARROW_LEFT,  ICON_ARROW_LEFT_W,  ICON_ARROW_LEFT_H };
-    pages[1][idx++] = { "RIGHT", nullptr, CONTENT_X + 2*cellW, CONTENT_Y + 1*cellH, cellW, cellH, ICON_ARROW_RIGHT, ICON_ARROW_RIGHT_W, ICON_ARROW_RIGHT_H };
-    pages[1][idx++] = { "DOWN",  nullptr, CONTENT_X + 1*cellW, CONTENT_Y + 2*cellH, cellW, cellH, ICON_ARROW_DOWN,  ICON_ARROW_DOWN_W,  ICON_ARROW_DOWN_H };
-
-    // Small center button, sitting in the D-pad's middle cell.
-    // Drawn as a red circle (see the special-case in drawButton()
-    // below) sized for ~11mm physical diameter on this 2.8" panel
-    // (240x320 px over 2.8" diagonal works out to ~5.6 px/mm).
-    {
-      int centerCellX = CONTENT_X + 1*cellW;
-      int centerCellY = CONTENT_Y + 1*cellH;
-      const int diameterPx = 62; // ~11mm
-      int smallX = centerCellX + (cellW - diameterPx) / 2;
-      int smallY = centerCellY + (cellH - diameterPx) / 2;
-      pages[1][idx++] = { "BTN_CENTER", "OK", smallX, smallY, diameterPx, diameterPx, nullptr, 0, 0 };
-    }
-    pageCounts[1] = idx;
-  }
-
-  // =========================================================
-  // PAGE 3: Reset, Tortoise, Wheel Repair, Battery. 2x2 grid.
+  // PAGE 2: Reset, Tortoise, Wheel Repair, Battery. 2x2 grid.
   // =========================================================
   {
     const int cols = 2, rows = 2, gap = 8;
@@ -108,14 +80,14 @@ void buildLayout() {
     for (int r = 0; r < rows; r++) {
       for (int c = 0; c < cols; c++) {
         FnDef &f = fns[r*cols + c];
-        pages[2][idx++] = { f.code, f.label, CONTENT_X + c*(cw+gap), CONTENT_Y + r*(ch+gap), cw, ch, f.icon, f.w, f.hgt };
+        pages[1][idx++] = { f.code, f.label, CONTENT_X + c*(cw+gap), CONTENT_Y + r*(ch+gap), cw, ch, f.icon, f.w, f.hgt };
       }
     }
-    pageCounts[2] = idx;
+    pageCounts[1] = idx;
   }
 
   // =========================================================
-  // PAGE 4: 2x fuel can + 4x tire (LF/RF/RR/LR). 3x2 grid.
+  // PAGE 3: 2x fuel can + 4x tire (LF/RF/RR/LR). 3x2 grid.
   // Tire buttons share one icon, so each gets a small corner
   // label (LF/RF/RR/LR) to tell them apart.
   // =========================================================
@@ -137,8 +109,36 @@ void buildLayout() {
     for (int r = 0; r < rows; r++) {
       for (int c = 0; c < cols; c++) {
         FnDef &f = fns[r*cols + c];
-        pages[3][idx++] = { f.code, f.label, CONTENT_X + c*(cw+gap), CONTENT_Y + r*(ch+gap), cw, ch, f.icon, f.w, f.hgt };
+        pages[2][idx++] = { f.code, f.label, CONTENT_X + c*(cw+gap), CONTENT_Y + r*(ch+gap), cw, ch, f.icon, f.w, f.hgt };
       }
+    }
+    pageCounts[2] = idx;
+  }
+
+  // =========================================================
+  // PAGE 4: D-pad, big, using the full content area, plus a
+  // small red circle "OK" button in the middle cell.
+  // =========================================================
+  {
+    const int cellW = CONTENT_W / 3;
+    const int cellH = CONTENT_H / 3;
+    int idx = 0;
+    pages[3][idx++] = { "UP",    nullptr, CONTENT_X + 1*cellW, CONTENT_Y + 0*cellH, cellW, cellH, ICON_ARROW_UP,    ICON_ARROW_UP_W,    ICON_ARROW_UP_H };
+    pages[3][idx++] = { "LEFT",  nullptr, CONTENT_X + 0*cellW, CONTENT_Y + 1*cellH, cellW, cellH, ICON_ARROW_LEFT,  ICON_ARROW_LEFT_W,  ICON_ARROW_LEFT_H };
+    pages[3][idx++] = { "RIGHT", nullptr, CONTENT_X + 2*cellW, CONTENT_Y + 1*cellH, cellW, cellH, ICON_ARROW_RIGHT, ICON_ARROW_RIGHT_W, ICON_ARROW_RIGHT_H };
+    pages[3][idx++] = { "DOWN",  nullptr, CONTENT_X + 1*cellW, CONTENT_Y + 2*cellH, cellW, cellH, ICON_ARROW_DOWN,  ICON_ARROW_DOWN_W,  ICON_ARROW_DOWN_H };
+
+    // Small center button, sitting in the D-pad's middle cell.
+    // Drawn as a red circle (see the special-case in drawButton()
+    // below) sized for ~11mm physical diameter on this 2.8" panel
+    // (240x320 px over 2.8" diagonal works out to ~5.6 px/mm).
+    {
+      int centerCellX = CONTENT_X + 1*cellW;
+      int centerCellY = CONTENT_Y + 1*cellH;
+      const int diameterPx = 62; // ~11mm
+      int smallX = centerCellX + (cellW - diameterPx) / 2;
+      int smallY = centerCellY + (cellH - diameterPx) / 2;
+      pages[3][idx++] = { "BTN_CENTER", "OK", smallX, smallY, diameterPx, diameterPx, nullptr, 0, 0 };
     }
     pageCounts[3] = idx;
   }
@@ -324,68 +324,66 @@ int touchedButton(int sx, int sy) {
 
 int lastPressed = -1;
 
-// ---------- Page slider (right edge) ----------
-// A dedicated vertical slider strip, completely separate from the
-// button area, so dragging it can never accidentally hit a button.
-// Has NUM_PAGES snap positions evenly spaced along the track.
+// ---------- Page buttons (right edge) ----------
+// A stack of small buttons, one per page, same width the old slider
+// used - completely separate from the button area so tapping here
+// can never accidentally hit a content button. Tap one to jump
+// straight to that page; the current page's button is filled in,
+// the rest are just outlined.
 const int SLIDER_X = 5;
 const int SLIDER_Y = 10;
 const int SLIDER_W = 27;
 const int SLIDER_H = 220;
-const int HANDLE_H = 50;
-const int SLIDER_HIT_X_MAX = 42; // slightly generous grab area to the right of the visible handle
-const uint16_t SLIDER_HANDLE_COLOR = TFT_BLUE;
+const int PAGE_BTN_GAP = 4;
+const int SLIDER_HIT_X_MAX = 42; // slightly generous grab area to the right of the buttons
+const uint16_t PAGE_BTN_COLOR = TFT_BLUE;
 
 bool isTouching = false;
-bool draggingSlider = false;
-int handleY = SLIDER_Y;
 
-int handleYForPage(int page) {
-  if (NUM_PAGES <= 1) return SLIDER_Y;
-  int travel = SLIDER_H - HANDLE_H;
-  return SLIDER_Y + (travel * page) / (NUM_PAGES - 1);
+int pageBtnHeight() {
+  return (SLIDER_H - PAGE_BTN_GAP * (NUM_PAGES - 1)) / NUM_PAGES;
+}
+
+int pageBtnY(int page) {
+  return SLIDER_Y + page * (pageBtnHeight() + PAGE_BTN_GAP);
 }
 
 bool isInSliderRegion(int sx, int sy) {
   return sx <= SLIDER_HIT_X_MAX;
 }
 
+// Returns which page button (0..NUM_PAGES-1) contains this point, or
+// -1 if the tap landed in a gap/outside all of them.
+int pageButtonAt(int sy) {
+  int h = pageBtnHeight();
+  for (int p = 0; p < NUM_PAGES; p++) {
+    int by = pageBtnY(p);
+    if (sy >= by && sy <= by + h) return p;
+  }
+  return -1;
+}
+
 void drawSlider() {
-  // Clear a bit wider than the handle itself so its old position
-  // never leaves a ghost behind while dragging.
+  // Clear a bit wider than the buttons themselves so nothing lingers
   lcd.fillRect(0, 0, SLIDER_X + SLIDER_W + 6, SCREEN_H, BG_COLOR);
 
-  int hy = draggingSlider ? handleY : handleYForPage(currentPage);
-  lcd.fillRoundRect(SLIDER_X + 2, hy, SLIDER_W - 4, HANDLE_H, 6, SLIDER_HANDLE_COLOR);
+  int h = pageBtnHeight();
+  for (int p = 0; p < NUM_PAGES; p++) {
+    int by = pageBtnY(p);
+    if (p == currentPage) {
+      lcd.fillRoundRect(SLIDER_X + 2, by, SLIDER_W - 4, h, 6, PAGE_BTN_COLOR);
+    } else {
+      lcd.drawRoundRect(SLIDER_X + 2, by, SLIDER_W - 4, h, 6, TFT_WHITE);
+    }
+  }
 }
 
-void updateSliderDrag(int touchY) {
-  handleY = touchY - HANDLE_H / 2;
-  if (handleY < SLIDER_Y) handleY = SLIDER_Y;
-  if (handleY > SLIDER_Y + SLIDER_H - HANDLE_H) handleY = SLIDER_Y + SLIDER_H - HANDLE_H;
-  drawSlider();
-}
-
-void finishSliderDrag() {
-  int handleCenter = handleY + HANDLE_H / 2;
-  int travel = SLIDER_H - HANDLE_H;
-  // Which of the NUM_PAGES evenly-spaced snap points is closest?
-  int newPage = 0;
-  if (travel > 0) {
-    float fraction = (float)(handleY - SLIDER_Y) / (float)travel;
-    newPage = (int)(fraction * (NUM_PAGES - 1) + 0.5f);
-  }
-  if (newPage < 0) newPage = 0;
-  if (newPage >= NUM_PAGES) newPage = NUM_PAGES - 1;
-
-  if (newPage != currentPage) {
-    currentPage = newPage;
-    drawAllButtons();
-    Serial.print("PAGE:");
-    Serial.println(currentPage);
-  } else {
-    drawSlider();
-  }
+void selectPage(int newPage) {
+  if (newPage < 0 || newPage >= NUM_PAGES || newPage == currentPage) return;
+  currentPage = newPage;
+  drawAllButtons();
+  Serial.print("PAGE:");
+  Serial.println(currentPage);
 }
 
 // ---------- Hidden easter egg ----------
@@ -556,39 +554,40 @@ void loop() {
 
   if (touchedNow && !isTouching) {
     isTouching = true;
-    draggingSlider = isInSliderRegion(x, y);
+    if (isInSliderRegion(x, y)) {
+      int tappedPage = pageButtonAt(y);
+      if (tappedPage >= 0) {
+        selectPage(tappedPage);
+      }
+    }
   }
 
   if (touchedNow && isTouching) {
-    if (draggingSlider) {
-      updateSliderDrag(y);
-    } else {
-      int idx = touchedButton(x, y);
-      bool valid = (idx >= 0 && hasCode(pages[currentPage][idx]));
-      int newPressed = valid ? idx : -1;
+    // Normal content-button handling. This is naturally a no-op when x
+    // falls in the page-button column, since no content button lives
+    // there - the two zones never overlap.
+    int idx = touchedButton(x, y);
+    bool valid = (idx >= 0 && hasCode(pages[currentPage][idx]));
+    int newPressed = valid ? idx : -1;
 
-      if (newPressed != lastPressed) {
-        if (lastPressed >= 0) {
-          drawButton(lastPressed, false);
-          Serial.print("RELEASE:");
-          Serial.println(pages[currentPage][lastPressed].code);
-        }
-        if (newPressed >= 0) {
-          drawButton(newPressed, true);
-          Serial.print("PRESS:");
-          Serial.println(pages[currentPage][newPressed].code);
-        }
-        lastPressed = newPressed;
+    if (newPressed != lastPressed) {
+      if (lastPressed >= 0) {
+        drawButton(lastPressed, false);
+        Serial.print("RELEASE:");
+        Serial.println(pages[currentPage][lastPressed].code);
       }
+      if (newPressed >= 0) {
+        drawButton(newPressed, true);
+        Serial.print("PRESS:");
+        Serial.println(pages[currentPage][newPressed].code);
+      }
+      lastPressed = newPressed;
     }
   }
 
   if (!touchedNow && isTouching) {
     isTouching = false;
-    if (draggingSlider) {
-      finishSliderDrag();
-      draggingSlider = false;
-    } else if (lastPressed >= 0) {
+    if (lastPressed >= 0) {
       drawButton(lastPressed, false);
       Serial.print("RELEASE:");
       Serial.println(pages[currentPage][lastPressed].code);
