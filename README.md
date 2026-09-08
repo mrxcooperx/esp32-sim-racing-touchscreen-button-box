@@ -1,6 +1,7 @@
 [Readmeesp32.txt](https://github.com/user-attachments/files/31941009/Readmeesp32.txt)
 The controller will add another controller to your PC using vJoy. 
-You need vJoy downloaded and setup to take a min of 40 buttons. This avoids conflicts if we add buttons in the future
+You need vJoy downloaded and setup to take 40 buttons for this new vJoy device.
+This avoids conflicts if we add buttons in the future
 
 
 arduino ide to flash the esp32 
