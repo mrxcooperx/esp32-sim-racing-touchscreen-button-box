@@ -17,5 +17,14 @@ vjoy
 https://sourceforge.net/projects/vjoystick/files/latest/download
 
 Python
+https://www.python.org/downloads/
 
+my settings 
+<img width="821" height="512" alt="image" src="https://github.com/user-attachments/assets/e96f1393-b510-4089-9514-e733f546849c" />
+
+<img width="792" height="500" alt="image" src="https://github.com/user-attachments/assets/55d9fa88-4b5c-4485-8224-5620741cf03b" />
+
+<img width="798" height="503" alt="image" src="https://github.com/user-attachments/assets/2ed54f9f-a158-4c0b-b140-0910b64dbcf6" />
+
+<img width="813" height="506" alt="image" src="https://github.com/user-attachments/assets/1dac5afc-aced-40f4-9c0f-ca34b70b1562" />
 
