@@ -19,6 +19,10 @@ https://sourceforge.net/projects/vjoystick/files/latest/download
 Python
 https://www.python.org/downloads/
 
+use python to run pip 
+python - m pip install pyserial pyvjoy pyirsdk pillow pystray
+
+
 my settings 
 <img width="821" height="512" alt="image" src="https://github.com/user-attachments/assets/e96f1393-b510-4089-9514-e733f546849c" />
 
