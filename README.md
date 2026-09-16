@@ -13,6 +13,9 @@ esp32 touchscreen 2.8"
 
 
 software needed 
+vjoy
+https://sourceforge.net/projects/vjoystick/files/latest/download
+
 Python
-vJoy
+
 
