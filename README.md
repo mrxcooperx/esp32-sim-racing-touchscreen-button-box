@@ -3,17 +3,6 @@
 <img width="1367" height="1140" alt="image" src="https://github.com/user-attachments/assets/dbb5297b-ba71-490c-a08e-c12cb66f2878" />
 
 
-
-arduino ide to flash the esp32 
-.ino file and .h file need to be in the same folder. ex . Project/Project.ino, icon.h file
-
-
-2.8 " TouchScreen Setup
-physical items needed
-esp32 touchscreen 2.8" 
-3d print case 
-
-
 software needed 
 vjoy
 https://sourceforge.net/projects/vjoystick/files/latest/download
