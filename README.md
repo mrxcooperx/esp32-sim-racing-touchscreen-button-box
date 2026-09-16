@@ -1,12 +1,9 @@
 [Readmeesp32.txt](https://github.com/user-attachments/files/31941009/Readmeesp32.txt)
-The controller will add another controller to your PC using vJoy. 
-You need vJoy downloaded and setup to take 40 buttons for this new vJoy device.
-This avoids conflicts if we add buttons in the future
+
 
 
 arduino ide to flash the esp32 
 .ino file and .h file need to be in the same folder. ex . Project/Project.ino, icon.h file
-
 
 
 2.8 " TouchScreen Setup
@@ -19,16 +16,3 @@ software needed
 Python
 vJoy
 
-
-
-python scripts
--noconsolescreeninput
--guiconsole , each unit that gets plugged in will show up as another device #to test functions run TestAll:PARTY
-
-
-
-
-my todo llist
-#add screenshots of each page 
-#vjoy screenshots 
-#links to apps needed 
