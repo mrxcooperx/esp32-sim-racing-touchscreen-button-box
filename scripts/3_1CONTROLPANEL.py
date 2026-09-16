@@ -30,6 +30,7 @@ import io
 import json
 import os
 import queue
+import socket
 import threading
 import time
 import tkinter as tk
@@ -78,10 +79,36 @@ BAUD_RATE = 115200
 PORT_HINTS = ["CP210", "CH340", "Silicon Labs", "USB-SERIAL", "USB2.0-Serial"]
 FLAG_POLL_INTERVAL = 0.5
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "button_mappings.json")
+IP_DEVICES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ip_devices.json")
+# Fixed local port we listen on for replies from ANY IP device (button
+# presses, PONGs, etc). The iracing_dash board hardcodes its replies to
+# this exact port; binding here also means the simpler flag-only WiFi
+# board's replies (which target whatever port it received a command
+# from) land here too, since that's the port we send everything from.
+LOCAL_UDP_LISTEN_PORT = 18251
+
+
+def load_ip_devices():
+    if os.path.exists(IP_DEVICES_FILE):
+        try:
+            with open(IP_DEVICES_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def save_ip_devices(devices):
+    # Only persist the user-editable fields - not runtime state like
+    # "connected", which gets rebuilt fresh every time the app starts.
+    clean = [{"name": d["name"], "host": d["host"], "port": d["port"], "enabled": d["enabled"]} for d in devices]
+    with open(IP_DEVICES_FILE, "w") as f:
+        json.dump(clean, f, indent=2)
 
 # Your current mapping, used only to create button_mappings.json the
 # very first time this runs. After that, the JSON file is the source
 # of truth and this constant is never read again.
+
 DEFAULT_MAPPING = {
     "UP": 1, "DOWN": 2, "LEFT": 3, "RIGHT": 4,
     "BTN_RESET": 5, "BTN_TORTOISE": 6, "BTN_WHEEL_REPAIR": 7, "BTN_BATTERY": 8,
@@ -91,6 +118,10 @@ DEFAULT_MAPPING = {
     "ADJ1_UP": 16, "ADJ1_DOWN": 17,
     "ADJ2_UP": 18, "ADJ2_DOWN": 19,
     "ADJ3_UP": 20, "ADJ3_DOWN": 21,
+    "PIT_FASTREPAIR": 22,"PIT_TIRES": 23,
+    "PIT_TEAROFF": 24, "PIT_FUEL": 25, "RR": 26, "LR": 27, "FL": 28,
+    "FR": 29, "1_UP": 30,
+    "1_DOWN": 31, "2_UP": 32, "2_DOWN": 33, "3_UP": 34, "3_DOWN": 35 
 }
 
 FLAG_COLORS = {
@@ -99,61 +130,6 @@ FLAG_COLORS = {
     "CHECKERED": "#ffffff", "BLUE": "#3498db", "DEBRIS": "#f1c40f",
 }
 
-# ---------------------------------------------------------------
-# Mirrors the exact button positions from button_box_8btn.ino's
-# buildLayout(). This is a SCHEMATIC view (shapes + text labels),
-# not a pixel-perfect copy of the real icon graphics - it's meant
-# to show you what's where and what's currently pressed, not
-# replace looking at the actual screen.
-# ---------------------------------------------------------------
-SCREEN_W, SCREEN_H = 320, 240
-
-PAGES_LAYOUT = [
-    [],  # Page 0: blank flag page - no buttons
-    [    # Page 1: D-pad + center circle
-        {"code": "UP",    "icon": "ARROW_UP",    "shape": "rect",   "x": 135, "y": 5,   "w": 90, "h": 76},
-        {"code": "LEFT",  "icon": "ARROW_LEFT",  "shape": "rect",   "x": 45,  "y": 81,  "w": 90, "h": 76},
-        {"code": "RIGHT", "icon": "ARROW_RIGHT", "shape": "rect",   "x": 225, "y": 81,  "w": 90, "h": 76},
-        {"code": "DOWN",  "icon": "ARROW_DOWN",  "shape": "rect",   "x": 135, "y": 157, "w": 90, "h": 76},
-        {"code": "BTN_CENTER", "label": "OK",    "shape": "circle", "x": 149, "y": 88,  "w": 62, "h": 62, "fill": "#e74c3c"},
-    ],
-    [    # Page 2: Reset / Tortoise / Wheel Repair / Battery
-        {"code": "BTN_RESET",        "icon": "RESET",        "shape": "rect", "x": 45,  "y": 5,   "w": 131, "h": 111},
-        {"code": "BTN_TORTOISE",     "icon": "TORTOISE",     "shape": "rect", "x": 184, "y": 5,   "w": 131, "h": 111},
-        {"code": "BTN_WHEEL_REPAIR", "icon": "WHEEL_REPAIR", "shape": "rect", "x": 45,  "y": 124, "w": 131, "h": 111},
-        {"code": "BTN_BATTERY",      "icon": "BATTERY",      "shape": "rect", "x": 184, "y": 124, "w": 131, "h": 111},
-    ],
-    [    # Page 3: 2x fuel can + 4x tire (tags match the sketch's current LF/RF swap)
-        {"code": "autotogglefuel", "icon": "GAS_CAN",    "tag": "Auto", "shape": "rect", "x": 45,  "y": 5,   "w": 84, "h": 111},
-        {"code": "TIRE_RF",        "icon": "TIRE_WHEEL", "tag": "LF",   "shape": "rect", "x": 137, "y": 5,   "w": 84, "h": 111},
-        {"code": "TIRE_LF",        "icon": "TIRE_WHEEL", "tag": "RF",   "shape": "rect", "x": 229, "y": 5,   "w": 84, "h": 111},
-        {"code": "8gallons",       "icon": "GAS_CAN",    "tag": "8g",   "shape": "rect", "x": 45,  "y": 124, "w": 84, "h": 111},
-        {"code": "TIRE_RR",        "icon": "TIRE_WHEEL", "tag": "LR",   "shape": "rect", "x": 137, "y": 124, "w": 84, "h": 111},
-        {"code": "TIRE_LR",        "icon": "TIRE_WHEEL", "tag": "RR",   "shape": "rect", "x": 229, "y": 124, "w": 84, "h": 111},
-    ],
-    [    # Page 4: 3 up/down adjuster pairs
-        {"code": "ADJ1_UP",   "icon": "ARROW_UP",   "tag": "ADJ1", "shape": "rect", "x": 45,  "y": 5,   "w": 84, "h": 111},
-        {"code": "ADJ2_UP",   "icon": "ARROW_UP",   "tag": "ADJ2", "shape": "rect", "x": 137, "y": 5,   "w": 84, "h": 111},
-        {"code": "ADJ3_UP",   "icon": "ARROW_UP",   "tag": "ADJ3", "shape": "rect", "x": 229, "y": 5,   "w": 84, "h": 111},
-        {"code": "ADJ1_DOWN", "icon": "ARROW_DOWN", "tag": "ADJ1", "shape": "rect", "x": 45,  "y": 124, "w": 84, "h": 111},
-        {"code": "ADJ2_DOWN", "icon": "ARROW_DOWN", "tag": "ADJ2", "shape": "rect", "x": 137, "y": 124, "w": 84, "h": 111},
-        {"code": "ADJ3_DOWN", "icon": "ARROW_DOWN", "tag": "ADJ3", "shape": "rect", "x": 229, "y": 124, "w": 84, "h": 111},
-    ],
-]
-PAGE_NAMES = ["Flag (blank)", "D-Pad", "Reset/Tortoise/Repair/Battery", "Fuel & Tires", "Adjusters"]
-
-# Slider strip, mirrored on the preview too (matches the real left-edge slider)
-SLIDER_X, SLIDER_Y, SLIDER_W, SLIDER_H, HANDLE_H = 5, 10, 27, 220, 50
-NUM_PAGES = len(PAGES_LAYOUT)
-
-
-def handle_y_for_page(page):
-    if NUM_PAGES <= 1:
-        return SLIDER_Y
-    travel = SLIDER_H - HANDLE_H
-    return SLIDER_Y + (travel * page) // (NUM_PAGES - 1)
-
-
 def text_color_for(hex_bg):
     hex_bg = hex_bg.lstrip("#")
     r, g, b = int(hex_bg[0:2], 16), int(hex_bg[2:4], 16), int(hex_bg[4:6], 16)
@@ -161,23 +137,41 @@ def text_color_for(hex_bg):
     return "#000000" if luminance > 150 else "#ffffff"
 
 
-def format_lap_time(total_seconds):
-    if total_seconds is None or total_seconds <= 0:
-        return "--:--.---"
-    minutes = int(total_seconds // 60)
-    secs = total_seconds - minutes * 60
-    return f"{minutes}:{secs:06.3f}"
+# Mapping is keyed by device (the same "port" string used everywhere
+# else - a COM port name or a configured IP device's name), each
+# holding its own {code: button} entries. DEFAULT_DEVICE_KEY holds a
+# fallback mapping used for any device with no entry of its own for a
+# given code - this is what makes two devices that both send the same
+# code (e.g. "TIRE_LF") able to trigger different vJoy buttons, while
+# devices that don't need per-device distinction keep working exactly
+# as before with zero configuration changes.
+DEFAULT_DEVICE_KEY = "_default"
+
+
+def _normalize_mapping(data):
+    """Accepts either the old flat {code: button} format or the new
+    per-device {device: {code: button}} format, always returning the
+    new format. An old-format file becomes the default/fallback
+    mapping, so every existing setup keeps working unchanged until a
+    device-specific override is deliberately added."""
+    if not data:
+        return {DEFAULT_DEVICE_KEY: {}}
+    first_value = next(iter(data.values()))
+    if isinstance(first_value, dict):
+        return data
+    return {DEFAULT_DEVICE_KEY: data}
 
 
 def load_mapping():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+                return _normalize_mapping(json.load(f))
         except Exception:
             pass
-    save_mapping(DEFAULT_MAPPING)
-    return dict(DEFAULT_MAPPING)
+    mapping = {DEFAULT_DEVICE_KEY: dict(DEFAULT_MAPPING)}
+    save_mapping(mapping)
+    return mapping
 
 
 def save_mapping(mapping):
@@ -234,12 +228,331 @@ class Backend:
         self.last_fuel_pct = None
         self.last_best_lap = None
 
+        # Any number of IP-connected devices (WiFi boards) - each gets
+        # the exact same broadcast messages as serial boards, and any
+        # PRESS:/RELEASE:/FLAG:/etc. lines they send back are routed
+        # through the same handle_line() as serial boards.
+        raw_devices = load_ip_devices()
+        self.ip_devices = []
+        for d in raw_devices:
+            d = dict(d)
+            d.setdefault("enabled", True)
+            d.setdefault("port", 4210)
+            d["connected"] = False
+            d["last_ping"] = 0.0
+            d["last_seen"] = 0.0
+            self.ip_devices.append(d)
+        self.ip_devices_lock = threading.Lock()
+
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.setblocking(False)
+        try:
+            self.udp_socket.bind(("0.0.0.0", LOCAL_UDP_LISTEN_PORT))
+        except OSError as e:
+            self.log(f"Could not bind UDP port {LOCAL_UDP_LISTEN_PORT} ({e}) - "
+                      f"IP device replies may not be received.")
+
+        # Fuel-calculator state (for the dash's Fuel page) - iRacing
+        # doesn't expose per-lap burn directly, so we track it ourselves
+        # by watching FuelLevel change each time Lap increments.
+        self.last_lap_num = None
+        self.last_lap_fuel_level = None
+        self.last_lap_burn = 0.0
+        self.fuel_burn_history = []
+
+    def set_ip_devices(self, devices):
+        """devices: list of {"name","host","port","enabled"}. Preserves
+        connected-state for entries that still match an existing one."""
+        with self.ip_devices_lock:
+            old_by_key = {(d["name"], d["host"], d["port"]): d for d in self.ip_devices}
+            new_list = []
+            for d in devices:
+                key = (d["name"], d["host"], d["port"])
+                merged = dict(d)
+                if key in old_by_key:
+                    old = old_by_key[key]
+                    merged["connected"] = old["connected"]
+                    merged["last_ping"] = old["last_ping"]
+                    merged["last_seen"] = old["last_seen"]
+                else:
+                    merged["connected"] = False
+                    merged["last_ping"] = 0.0
+                    merged["last_seen"] = 0.0
+                new_list.append(merged)
+            self.ip_devices = new_list
+        save_ip_devices(devices)
+
+    def _track_fuel_burn(self, ir):
+        """iRacing doesn't expose per-lap fuel burn directly - track it
+        ourselves by snapshotting FuelLevel each time Lap increments."""
+        current_lap = ir["Lap"]
+        current_fuel = ir["FuelLevel"]
+        if current_lap is None or current_fuel is None:
+            return
+        if (self.last_lap_num is not None and current_lap > self.last_lap_num
+                and self.last_lap_fuel_level is not None):
+            burn = self.last_lap_fuel_level - current_fuel
+            if 0 < burn < 50:  # sanity bounds - ignores refuels/resets
+                self.last_lap_burn = burn
+                self.fuel_burn_history.append(burn)
+                if len(self.fuel_burn_history) > 5:
+                    self.fuel_burn_history.pop(0)
+        if current_lap != self.last_lap_num:
+            self.last_lap_num = current_lap
+            self.last_lap_fuel_level = current_fuel
+
+    def _build_relative_line(self, ir):
+        """Best-effort relative (gap to nearby cars) computation. This
+        is the least certain part of the telemetry - iRacing doesn't
+        give a single ready-made "gap in seconds" per car, so this
+        estimates it from lap-distance-percent difference times your
+        best lap time. Verify this against real session data; a more
+        precise version would use track-specific timing."""
+        dist_pct = ir["CarIdxLapDistPct"]
+        player_idx = ir["PlayerCarIdx"]
+        if dist_pct is None or player_idx is None:
+            return None
+        player_dist = dist_pct[player_idx]
+        if player_dist is None or player_dist < 0:
+            return None
+
+        try:
+            drivers = ir["DriverInfo"]["Drivers"]
+        except Exception:
+            drivers = []
+
+        est_lap_time = ir["LapBestLapTime"] or 90.0
+        entries = []
+        for idx, d in enumerate(dist_pct):
+            if idx == player_idx or d is None or d < 0:
+                continue
+            gap_pct = d - player_dist
+            if gap_pct > 0.5:
+                gap_pct -= 1.0
+            if gap_pct < -0.5:
+                gap_pct += 1.0
+            gap_seconds = gap_pct * est_lap_time
+
+            name, car_num, class_color = f"Car {idx}", 0, 0xFFFFFF
+            for drv in drivers:
+                if drv.get("CarIdx") == idx:
+                    name = (drv.get("UserName") or name)[:13]
+                    try:
+                        car_num = int(drv.get("CarNumber", 0) or 0)
+                    except ValueError:
+                        car_num = 0
+                    class_color = drv.get("CarClassColor", 0xFFFFFF) or 0xFFFFFF
+                    break
+            entries.append((abs(gap_seconds), gap_seconds, name, car_num, class_color))
+
+        entries.sort(key=lambda e: e[0])
+        parts = []
+        for _, gap_seconds, name, car_num, class_color in entries[:5]:
+            clean_name = name.replace(",", "").replace(";", "")
+            parts.append(f"{gap_seconds:.1f},{clean_name},{car_num},{class_color:06X},0")
+        return "R:" + ";".join(parts)
+
+    def _build_map_line(self, ir):
+        """Track map data: the player's own lap-distance-percent first,
+        then every other car's, semicolon-separated. Kept deliberately
+        compact (just numbers, no names/colors) since a full field can
+        be 60+ cars sent every poll cycle."""
+        dist_pct = ir["CarIdxLapDistPct"]
+        player_idx = ir["PlayerCarIdx"]
+        if dist_pct is None or player_idx is None:
+            return None
+        player_pct = dist_pct[player_idx]
+        if player_pct is None or player_pct < 0:
+            return None
+        parts = [f"{player_pct:.3f}"]
+        for idx, d in enumerate(dist_pct):
+            if idx == player_idx or d is None or d < 0:
+                continue
+            parts.append(f"{d:.3f}")
+        return "M:" + ";".join(parts)
+
+    def _build_dash_lines(self, ir):
+        """Builds the T:/R:/F:/W:/P:/C:/A: protocol lines iracing_dash.ino
+        expects. Beyond the core variables already used elsewhere in this
+        file (Lap, FuelLevel, LapBestLapTime - already confirmed working),
+        the rest are best-effort names from public iRacing SDK docs. If a
+        field consistently reads 0 for your car, that variable name may
+        need adjusting - this hasn't been tested against a live session."""
+
+        def g(name, default=0):
+            v = ir[name]
+            return v if v is not None else default
+
+        lines = []
+
+        # --- Timing ---
+        lap = g("Lap", 0)
+        last_lap = g("LapLastLapTime", 0.0)
+        best_lap = g("LapBestLapTime", 0.0)
+        delta = g("LapDeltaToBestLap", 0.0)
+        sess_time = ir["SessionTimeRemain"]
+        sess_time = sess_time if sess_time is not None else -1
+        sess_laps = ir["SessionLapsRemainEx"]
+        sess_laps = sess_laps if sess_laps is not None else -1
+        position = g("PlayerCarPosition", 0)
+        class_pos = g("PlayerCarClassPosition", 0)
+        incidents = g("PlayerCarMyIncidentCount", 0)
+        inc_limit = 17
+        try:
+            inc_limit = ir["WeekendInfo"]["TeamIncidentLimit"] or 17
+        except Exception:
+            pass
+        lines.append(
+            f"T:{lap},{last_lap:.3f},{best_lap:.3f},{delta:.3f},"
+            f"{sess_time:.0f},{sess_laps},{position},{class_pos},{incidents},{inc_limit}"
+        )
+
+        # --- Fuel ---
+        self._track_fuel_burn(ir)
+        remaining = g("FuelLevel", 0.0)
+        avg_burn = (sum(self.fuel_burn_history) / len(self.fuel_burn_history)) if self.fuel_burn_history else 0.0
+        laps_of_fuel = (remaining / avg_burn) if avg_burn > 0 else 0.0
+        laps_remain = sess_laps if (sess_laps and sess_laps > 0) else 0
+        fuel_to_end = avg_burn * laps_remain
+        fuel_to_add = max(0.0, fuel_to_end - remaining)
+        lines.append(
+            f"F:{remaining:.2f},{self.last_lap_burn:.2f},{avg_burn:.2f},"
+            f"{laps_of_fuel:.1f},{laps_remain},{fuel_to_end:.2f},{fuel_to_add:.2f}"
+        )
+
+        # --- Tires: LF, RF, LR, RR - temp/wear/pressure ---
+        corners = [
+            ("LFtempCM", "LFwearM", "LFpress"),
+            ("RFtempCM", "RFwearM", "RFpress"),
+            ("LRtempCM", "LRwearM", "LRpress"),
+            ("RRtempCM", "RRwearM", "RRpress"),
+        ]
+        tire_vals = []
+        for temp_var, wear_var, press_var in corners:
+            tire_vals += [f"{g(temp_var, 0.0):.1f}", f"{g(wear_var, 100.0):.1f}", f"{g(press_var, 0.0):.1f}"]
+        lines.append("W:" + ",".join(tire_vals))
+
+        # --- Pit service --- PlayerCarPitSvFlags bit layout per public
+        # iRacing SDK docs: LF=0x01 RF=0x02 LR=0x04 RR=0x08 Fuel=0x10
+        # WindshieldTearoff=0x20 FastRepair=0x40
+        pit_flags = g("PlayerCarPitSvFlags", 0)
+        fuel_armed = 1 if (pit_flags & 0x10) else 0
+        lf_armed = 1 if (pit_flags & 0x01) else 0
+        rf_armed = 1 if (pit_flags & 0x02) else 0
+        lr_armed = 1 if (pit_flags & 0x04) else 0
+        rr_armed = 1 if (pit_flags & 0x08) else 0
+        tear_armed = 1 if (pit_flags & 0x20) else 0
+        fr_armed = 1 if (pit_flags & 0x40) else 0
+        fr_left = g("FastRepairAvailable", 0)
+        repair_req = g("PitRepairLeft", 0.0)
+        repair_opt = g("PitOptRepairLeft", 0.0)
+        limiter = 1 if g("EngineWarnings", 0) else 0  # best-effort - verify
+        lines.append(
+            f"P:{fuel_armed},{lf_armed},{rf_armed},{lr_armed},{rr_armed},"
+            f"{tear_armed},{fr_armed},{fr_left},{repair_req:.1f},{repair_opt:.1f},{limiter}"
+        )
+
+        # --- Car state ---
+        gear = g("Gear", 0)
+        speed_mph = g("Speed", 0.0) * 2.23694  # m/s -> mph
+        rpm = g("RPM", 0.0)
+        max_rpm = 8000
+        try:
+            max_rpm = ir["DriverInfo"]["DriverCarRedLine"] or 8000
+        except Exception:
+            pass
+        throttle = g("Throttle", 0.0) * 100
+        brake = g("Brake", 0.0) * 100
+        lines.append(f"C:{gear},{speed_mph:.1f},{rpm:.0f},{max_rpm:.0f},{throttle:.1f},{brake:.1f}")
+
+        # --- Relative --- (see _build_relative_line docstring re: confidence)
+        try:
+            rel_line = self._build_relative_line(ir)
+            if rel_line:
+                lines.append(rel_line)
+        except Exception as e:
+            self.log(f"Relative telemetry error: {e}")
+
+        # --- Track map (schematic - see _build_map_line docstring) ---
+        try:
+            map_line = self._build_map_line(ir)
+            if map_line:
+                lines.append(map_line)
+        except Exception as e:
+            self.log(f"Map telemetry error: {e}")
+
+        # --- Adjustments --- highly car-dependent; these three (traction
+        # control, brake bias, ABS) are common but not universal - rename
+        # the label/variable pairs below to match whatever car you drive.
+        adj_defs = [("TC", "dcTractionControl"), ("BB", "dcBrakeBias"), ("ABS", "dcABS")]
+        parts = []
+        for label, var in adj_defs:
+            val = ir[var]
+            parts.append(label)
+            parts.append(f"{val:.1f}" if val is not None else "--")
+        lines.append("A:" + ",".join(parts))
+
+        return lines
+
+    def _parse_telemetry_lines(self, lines):
+        """Turns the same T:/F:/W:/P:/C:/A:/R: lines just sent to the dash
+        into a plain dict for the control panel's own Black Box Telemetry
+        tab - parsed from the actual sent lines (not re-read from iRacing)
+        so the GUI can never show something different from the dash."""
+        data = {}
+        for line in lines:
+            if line.startswith("T:"):
+                p = line[2:].split(",")
+                if len(p) == 10:
+                    data["timing"] = dict(zip(
+                        ["lap", "last_lap", "best_lap", "delta", "sess_time",
+                         "sess_laps", "position", "class_pos", "incidents", "inc_limit"], p))
+            elif line.startswith("F:"):
+                p = line[2:].split(",")
+                if len(p) == 7:
+                    data["fuel"] = dict(zip(
+                        ["remaining", "last_burn", "avg_burn", "laps_of_fuel",
+                         "laps_remain", "to_end", "to_add"], p))
+            elif line.startswith("W:"):
+                p = line[2:].split(",")
+                if len(p) == 12:
+                    data["tires"] = {}
+                    for i, corner in enumerate(["LF", "RF", "LR", "RR"]):
+                        data["tires"][corner] = {"temp": p[i*3], "wear": p[i*3+1], "press": p[i*3+2]}
+            elif line.startswith("P:"):
+                p = line[2:].split(",")
+                if len(p) == 11:
+                    data["pit"] = dict(zip(
+                        ["fuel", "lf", "rf", "lr", "rr", "tear", "fr",
+                         "fr_left", "repair_req", "repair_opt", "limiter"], p))
+            elif line.startswith("C:"):
+                p = line[2:].split(",")
+                if len(p) == 6:
+                    data["car"] = dict(zip(
+                        ["gear", "speed", "rpm", "max_rpm", "throttle", "brake"], p))
+            elif line.startswith("A:"):
+                p = line[2:].split(",")
+                data["adj"] = {p[i]: p[i+1] for i in range(0, len(p) - 1, 2)}
+            elif line.startswith("R:"):
+                rel = []
+                for entry in line[2:].split(";"):
+                    if not entry:
+                        continue
+                    f = entry.split(",")
+                    if len(f) == 5:
+                        rel.append({"gap": f[0], "name": f[1], "num": f[2], "color": f[3]})
+                data["relative"] = rel
+        return data
+
     def log(self, msg):
         self.q.put(("log", msg))
 
-    def get_button(self, code):
+    def get_button(self, port, code):
         with self.mapping_lock:
-            return self.mapping_ref.get(code)
+            device_map = self.mapping_ref.get(port, {})
+            if code in device_map:
+                return device_map[code]
+            return self.mapping_ref.get(DEFAULT_DEVICE_KEY, {}).get(code)
 
     def connect_vjoy(self):
         while not self.stop_flag.is_set():
@@ -330,15 +643,23 @@ class Backend:
                     if best_lap is not None and best_lap != self.last_best_lap:
                         self.last_best_lap = best_lap
                         self.log(f"Best lap: {best_lap:.3f}s")
-                        self.q.put(("laptime", best_lap))
                         self._send_to_all(f"LAPTIME:{best_lap}\n")
+
+                    # Rich telemetry for iracing_dash.ino - harmless to
+                    # send to other board types too, they just ignore
+                    # prefixes they don't recognize (T:/R:/F:/W:/P:/C:/A:).
+                    dash_lines = self._build_dash_lines(self.ir)
+                    for line in dash_lines:
+                        self._send_to_all(line + "\n")
+                    self.q.put(("telemetry", self._parse_telemetry_lines(dash_lines)))
                 elif self.last_fuel_pct is not None:
                     self.last_fuel_pct = None
                     self.q.put(("fuel", None))
                     if self.last_best_lap is not None:
                         self.last_best_lap = None
-                        self.q.put(("laptime", None))
                         self._send_to_all("LAPTIME:-1\n")
+
+            self._update_ip_devices(now)
 
             with self.connections_lock:
                 have_connections = bool(self.connections)
@@ -347,6 +668,56 @@ class Backend:
         with self.connections_lock:
             for ser in self.connections.values():
                 ser.close()
+
+    def _update_ip_devices(self, now):
+        """Pings every enabled IP device every 2s, and drains any
+        incoming UDP data - both PONG replies (proof of life) and real
+        protocol lines (PRESS:/RELEASE:/PAGE:/etc.), which get routed
+        into handle_line() exactly like a serial board's traffic."""
+        with self.ip_devices_lock:
+            devices = list(self.ip_devices)
+
+        for d in devices:
+            if not d["enabled"]:
+                continue
+            if (now - d["last_ping"]) >= 2.0:
+                d["last_ping"] = now
+                try:
+                    self.udp_socket.sendto(b"PING", (d["host"], d["port"]))
+                except OSError:
+                    pass
+
+        try:
+            while True:
+                data, addr = self.udp_socket.recvfrom(1024)
+                sender_ip = addr[0]
+                match = next((d for d in devices if d["host"] == sender_ip), None)
+                if match is not None:
+                    match["last_seen"] = now
+                if data.strip() != b"PONG":
+                    label = match["name"] if match else sender_ip
+                    for line in data.decode("utf-8", errors="ignore").splitlines():
+                        line = line.strip()
+                        if line:
+                            self.handle_line(label, line)
+        except OSError:
+            pass  # no data waiting - normal for a non-blocking socket
+
+        changed = False
+        for d in devices:
+            if not d["enabled"]:
+                if d["connected"]:
+                    d["connected"] = False
+                    changed = True
+                continue
+            was = d["connected"]
+            d["connected"] = d["last_seen"] > 0 and (now - d["last_seen"]) < 60.0
+            if d["connected"] != was:
+                changed = True
+        if changed:
+            with self.ip_devices_lock:
+                self.ip_devices = devices
+            self.q.put(("ip_devices_status", [(d["name"], d["connected"]) for d in devices]))
 
     def _send_to_all(self, message):
         with self.connections_lock:
@@ -357,6 +728,16 @@ class Backend:
             except (serial.SerialException, OSError):
                 pass
 
+        with self.ip_devices_lock:
+            devices = list(self.ip_devices)
+        for d in devices:
+            if not d["enabled"]:
+                continue
+            try:
+                self.udp_socket.sendto(message.encode("utf-8"), (d["host"], d["port"]))
+            except OSError as e:
+                self.log(f"IP device '{d['name']}' send failed: {e}")
+
     def trigger_flag(self, name):
         """Manually broadcast a flag, e.g. from the GUI's flag buttons.
         Note: if iRacing is connected and actively sending a different
@@ -366,37 +747,25 @@ class Backend:
         self.q.put(("flag", name))
         self._send_to_all(f"FLAG:{name}\n")
 
+    def _handle_button_event(self, port, code, pressed):
+        btn = self.get_button(port, code)
+        if btn is None:
+            self.log(f"({port}) No mapping for '{code}'")
+            return
+        try:
+            self.j.set_button(btn, 1 if pressed else 0)
+            self.q.put(("press" if pressed else "release", port, code, btn))
+        except Exception as e:
+            self.log(f"vJoy error on button {btn} ('{code}'): {e} - "
+                      f"is vJoy Device 1 configured with at least {btn} buttons?")
+
     def handle_line(self, port, line):
         if line.startswith("PRESS:"):
-            code = line[len("PRESS:"):]
-            btn = self.get_button(code)
-            if btn is None:
-                self.log(f"({port}) No mapping for '{code}'")
-            else:
-                try:
-                    self.j.set_button(btn, 1)
-                    self.q.put(("press", port, code, btn))
-                except Exception as e:
-                    self.log(f"vJoy error on button {btn} ('{code}'): {e} - "
-                              f"is vJoy Device 1 configured with at least {btn} buttons?")
+            self._handle_button_event(port, line[len("PRESS:"):], True)
         elif line.startswith("RELEASE:"):
-            code = line[len("RELEASE:"):]
-            btn = self.get_button(code)
-            if btn is None:
-                self.log(f"({port}) No mapping for '{code}'")
-            else:
-                try:
-                    self.j.set_button(btn, 0)
-                    self.q.put(("release", port, code, btn))
-                except Exception as e:
-                    self.log(f"vJoy error on button {btn} ('{code}'): {e} - "
-                              f"is vJoy Device 1 configured with at least {btn} buttons?")
+            self._handle_button_event(port, line[len("RELEASE:"):], False)
         elif line.startswith("PAGE:"):
-            try:
-                page_num = int(line[len("PAGE:"):])
-                self.q.put(("page", port, page_num))
-            except ValueError:
-                pass
+            pass
         elif not line.startswith("FLAG:") and "ready" not in line.lower():
             self.log(f"({port}) {line}")
 
@@ -408,23 +777,19 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Button Box Control Panel")
-        self.geometry("1400x650")
+        self.geometry("1900x1420")
 
         self.mapping_lock = threading.Lock()
         self.mapping = load_mapping()
         self.event_queue = queue.Queue()
 
-        # Preview state
-        self.preview_flag = "NONE"       # shared - same flag broadcasts to every board
-        self.best_lap_str = "--:--.---"  # shared - same telemetry value for every board
-        self.board_previews = {}         # port -> {"page": int, "pressed_code": str|None}
-        self.preview_widgets = {}        # port -> {"frame", "canvas", "page_label"}
+        self.serial_ports = []
+        self.connected_ip_names = []
+        self.latest_telemetry = {}       # most recent parsed T:/F:/W:/P:/C:/A:/R: data
         self.PREVIEW_SCALE = 1.0  # true size - matches the real 320x240 screen exactly
         self._icon_cache = {}   # (name, size) -> ImageTk.PhotoImage
         self._base_icons = {name: Image.open(io.BytesIO(base64.b64decode(b64)))
                              for name, b64 in ICON_B64.items()}
-
-        self.fuel_pct = None
 
         self._apply_dark_theme()
 
@@ -454,8 +819,10 @@ class App(tk.Tk):
         ACCENT = "#3498db"
         BORDER = "#3d3d3d"
         SELECT_BG = "#3a3a3a"
+        UI_FONT = ("", 22)
 
         self.dark_bg_rgb = (0x2b, 0x2b, 0x2b)  # matches BG_ALT, for flattening icons onto
+        self.ui_font = UI_FONT  # reused for raw tk widgets that don't inherit ttk styles
 
         self.configure(bg=BG)
 
@@ -463,22 +830,22 @@ class App(tk.Tk):
         style.theme_use("clam")
 
         style.configure(".", background=BG, foreground=FG, fieldbackground=BG_ALT,
-                         bordercolor=BORDER, lightcolor=BG, darkcolor=BG)
+                         bordercolor=BORDER, lightcolor=BG, darkcolor=BG, font=UI_FONT)
         style.configure("TFrame", background=BG)
-        style.configure("TLabel", background=BG, foreground=FG)
+        style.configure("TLabel", background=BG, foreground=FG, font=UI_FONT)
         style.configure("TButton", background=BG_ALT, foreground=FG, bordercolor=BORDER,
-                         focusthickness=0, padding=4)
+                         focusthickness=0, padding=4, font=UI_FONT)
         style.map("TButton", background=[("active", SELECT_BG)])
         style.configure("TNotebook", background=BG, bordercolor=BORDER)
-        style.configure("TNotebook.Tab", background=BG_ALT, foreground=FG, padding=(10, 4))
+        style.configure("TNotebook.Tab", background=BG_ALT, foreground=FG, padding=(10, 4), font=UI_FONT)
         style.map("TNotebook.Tab",
                   background=[("selected", BG)],
                   foreground=[("selected", ACCENT)])
         style.configure("TEntry", fieldbackground=BG_ALT, foreground=FG, bordercolor=BORDER,
-                         insertcolor=FG)
+                         insertcolor=FG, font=UI_FONT)
         style.configure("Treeview", background=BG_ALT, foreground=FG, fieldbackground=BG_ALT,
-                         bordercolor=BORDER)
-        style.configure("Treeview.Heading", background=BG, foreground=FG, bordercolor=BORDER)
+                         bordercolor=BORDER, font=UI_FONT, rowheight=36)
+        style.configure("Treeview.Heading", background=BG, foreground=FG, bordercolor=BORDER, font=UI_FONT)
         style.map("Treeview",
                   background=[("selected", ACCENT)],
                   foreground=[("selected", "#ffffff")])
@@ -486,31 +853,9 @@ class App(tk.Tk):
     def _build_ui(self):
         container = ttk.Frame(self)
         container.pack(fill="both", expand=True)
-        container.columnconfigure(0, weight=1)
-        container.columnconfigure(1, weight=0)
-        container.rowconfigure(0, weight=1)
 
         notebook = ttk.Notebook(container)
-        notebook.grid(row=0, column=0, sticky="nsew")
-
-        # ---------------- Persistent Display Preview panels ----------------
-        # Lives outside the notebook entirely, top-right, so it stays put
-        # no matter which tab (Status / Button Mappings) is selected.
-        # One independent sub-panel per connected board.
-        preview_outer = ttk.Frame(container)
-        preview_outer.grid(row=0, column=1, sticky="n", padx=10, pady=10)
-
-        ttk.Label(preview_outer, text="Display Preview", font=("", 11, "bold")).pack(anchor="w")
-        ttk.Label(
-            preview_outer,
-            text="Schematic - shapes/icons, not pixel-perfect. One panel per connected board.",
-            wraplength=300, justify="left", font=("", 8),
-        ).pack(anchor="w", pady=(0, 8))
-
-        self.preview_panels_row = ttk.Frame(preview_outer)
-        self.preview_panels_row.pack(anchor="n")
-
-        self._rebuild_preview_panels([])  # populated once boards connect
+        notebook.pack(fill="both", expand=True)
 
         # ---------------- Status tab ----------------
         status_tab = ttk.Frame(notebook)
@@ -545,7 +890,7 @@ class App(tk.Tk):
 
         self.fuel_icon_label = tk.Label(fuel_frame, bg=self.cget("bg"))
         self.fuel_icon_label.pack(side="left", padx=(0, 6))
-        self._set_fuel_icon(None)
+        self._set_fuel_icon()
 
         self.fuel_canvas = tk.Canvas(fuel_frame, width=200, height=18, highlightthickness=1,
                                       highlightbackground="#888", bg="#222222")
@@ -554,22 +899,68 @@ class App(tk.Tk):
         self.fuel_pct_label = ttk.Label(fuel_frame, text="no data (iRacing not running)")
         self.fuel_pct_label.pack(side="left", padx=8)
 
+        # --- IP-connected devices (WiFi boards) ---
+        ttk.Label(top_frame, text="IP Devices:").grid(row=5, column=0, sticky="nw", pady=2)
+        ip_frame = ttk.Frame(top_frame)
+        ip_frame.grid(row=5, column=1, columnspan=3, sticky="w", padx=5, pady=2)
+
+        self.ip_tree = ttk.Treeview(
+            ip_frame, columns=("name", "host", "port", "enabled", "status"),
+            show="headings", height=4,
+        )
+        for col, text, width in [
+            ("name", "Name", 180), ("host", "Host/IP", 240), ("port", "Port", 110),
+            ("enabled", "Enabled", 110), ("status", "Status", 160),
+        ]:
+            self.ip_tree.heading(col, text=text)
+            self.ip_tree.column(col, width=width, anchor="center" if col != "name" and col != "host" else "w")
+        self.ip_tree.pack(side="top", fill="x")
+        self.ip_tree.bind("<Double-1>", self._edit_ip_device_cell)
+        self._refresh_ip_tree()
+
+        ip_add_frame = ttk.Frame(ip_frame)
+        ip_add_frame.pack(side="top", fill="x", pady=(4, 0))
+        ttk.Label(ip_add_frame, text="Name:").pack(side="left")
+        self.ip_name_entry = ttk.Entry(ip_add_frame, width=12)
+        self.ip_name_entry.pack(side="left", padx=(2, 8))
+        ttk.Label(ip_add_frame, text="Host:").pack(side="left")
+        self.ip_host_entry = ttk.Entry(ip_add_frame, width=18)
+        self.ip_host_entry.pack(side="left", padx=(2, 8))
+        ttk.Label(ip_add_frame, text="Port:").pack(side="left")
+        self.ip_port_entry = ttk.Entry(ip_add_frame, width=6)
+        self.ip_port_entry.insert(0, "4210")
+        self.ip_port_entry.pack(side="left", padx=(2, 8))
+        ttk.Button(ip_add_frame, text="Add", command=self._add_ip_device).pack(side="left", padx=(0, 4))
+        ttk.Button(ip_add_frame, text="Delete Selected", command=self._delete_ip_device).pack(side="left")
+        ttk.Label(
+            ip_frame, text="Double-click Enabled to toggle. Host = IP or hostname, e.g. flagdisplay.local",
+            font=("", 8),
+        ).pack(side="top", anchor="w", pady=(2, 0))
+
         # --- Manual flag triggers ---
         ttk.Label(status_tab, text="Manual flag trigger (for testing without iRacing running):").pack(
             anchor="w", padx=10, pady=(10, 2)
         )
         flag_btn_frame = ttk.Frame(status_tab)
         flag_btn_frame.pack(anchor="w", padx=10, pady=(0, 10))
-        for name in ["GREEN", "YELLOW", "RED", "BLUE", "DEBRIS", "WHITE", "BLACK", "CHECKERED", "NONE"]:
-            ttk.Button(
-                flag_btn_frame, text=name, width=10,
+        flag_names = ["GREEN", "YELLOW", "RED", "BLUE", "DEBRIS", "WHITE", "BLACK", "CHECKERED", "NONE"]
+        FLAG_BTN_COLS = 3
+        for i, name in enumerate(flag_names):
+            bg = FLAG_COLORS.get(name, "#333333")
+            fg = text_color_for(bg)
+            btn = tk.Button(
+                flag_btn_frame, text=name, width=10, bg=bg, fg=fg,
+                activebackground=bg, activeforeground=fg,
+                relief="raised", borderwidth=2, font=self.ui_font,
                 command=lambda n=name: self.backend.trigger_flag(n),
-            ).pack(side="left", padx=3)
+            )
+            r, c = divmod(i, FLAG_BTN_COLS)
+            btn.grid(row=r, column=c, padx=3, pady=3, sticky="ew")
 
         # --- Manual raw command entry ---
         ttk.Label(
             status_tab,
-            text="Manual command (sent as-is to all connected boards, e.g. FLAG:BLUE, PRESS:UP, RELEASE:UP):",
+            text="Manual command (sent to boards ex: TestAll:PARTY ",
         ).pack(anchor="w", padx=10, pady=(5, 2))
         cmd_frame = ttk.Frame(status_tab)
         cmd_frame.pack(fill="x", padx=10, pady=(0, 10))
@@ -578,9 +969,15 @@ class App(tk.Tk):
         self.command_entry.bind("<Return>", lambda e: self._send_manual_command())
         ttk.Button(cmd_frame, text="Send", command=self._send_manual_command).pack(side="left")
 
-        ttk.Label(status_tab, text="Live log:").pack(anchor="w", padx=10)
-        self.log_text = tk.Text(status_tab, height=20, state="disabled", bg="#111111", fg="#dddddd")
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # Fixed-size log, same width as the real display (320px), newest
+        # entries at the top instead of the bottom (see _append_log).
+        ttk.Label(status_tab, text="Live log (newest first):").pack(anchor="w", padx=10)
+        log_frame = tk.Frame(status_tab, width=900, height=400, bg="#111111")
+        log_frame.pack(padx=10, pady=(0, 10), anchor="w")
+        log_frame.pack_propagate(False)
+        self.log_text = tk.Text(log_frame, state="disabled", bg="#111111", fg="#dddddd",
+                                 wrap="word", font=self.ui_font)
+        self.log_text.pack(fill="both", expand=True)
 
         # ---------------- Mappings tab ----------------
         map_tab = ttk.Frame(notebook)
@@ -590,11 +987,28 @@ class App(tk.Tk):
             anchor="w", padx=10, pady=(10, 0)
         )
 
+        device_frame = ttk.Frame(map_tab)
+        device_frame.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Label(device_frame, text="Device:").pack(side="left")
+        self.mapping_device_var = tk.StringVar(value="Default (fallback for all devices)")
+        self.mapping_device_combo = ttk.Combobox(
+            device_frame, textvariable=self.mapping_device_var,
+            values=self._mapping_device_options(), width=40,
+        )
+        self.mapping_device_combo.pack(side="left", padx=5)
+        self.mapping_device_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_tree())
+        self.mapping_device_combo.bind("<Return>", lambda e: self._refresh_tree())
+        ttk.Label(
+            device_frame,
+            text="Type a new device name (matching its port/name in the log) to give it its own overrides.",
+            font=("", 9),
+        ).pack(side="left", padx=10)
+
         self.tree = ttk.Treeview(map_tab, columns=("code", "button"), show="headings", height=16)
         self.tree.heading("code", text="Code")
         self.tree.heading("button", text="vJoy Button #")
-        self.tree.column("code", width=280)
-        self.tree.column("button", width=120, anchor="center")
+        self.tree.column("code", width=550)
+        self.tree.column("button", width=220, anchor="center")
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
         self.tree.bind("<Double-1>", self._edit_mapping_cell)
 
@@ -612,152 +1026,127 @@ class App(tk.Tk):
         ttk.Button(add_frame, text="Delete Selected", command=self._delete_mapping).pack(side="left", padx=5)
         ttk.Button(add_frame, text="Save", command=self._save_mappings).pack(side="right", padx=5)
 
-    def _draw_outlined_text(self, canvas, text, x, y, font_size):
-        # Black outline so text stays readable over any background,
-        # including the checkered/striped patterns - same trick the
-        # firmware uses for the same reason.
-        off = 2
-        for dx, dy in [(-off, 0), (off, 0), (0, -off), (0, off)]:
-            canvas.create_text(x + dx, y + dy, text=text, fill="#000000",
-                                font=("", font_size, "bold"), justify="center")
-        canvas.create_text(x, y, text=text, fill="#ffffff",
-                            font=("", font_size, "bold"), justify="center")
+        # ---------------- Black Box Telemetry tab ----------------
+        # Mirrors the exact same T:/F:/W:/P:/C:/A:/R: data sent to
+        # iracing_dash.ino, so this always matches what the dash shows.
+        telem_tab = ttk.Frame(notebook)
+        notebook.add(telem_tab, text="Black Box Telemetry")
+        ttk.Label(
+            telem_tab,
+            text="Live iRacing telemetry - the same data sent to the dash. Blank until iRacing is running.",
+        ).pack(anchor="w", padx=10, pady=(10, 5))
 
-    def _add_preview_panel(self, port):
-        self.board_previews[port] = {"page": 0, "pressed_code": None}
+        telem_grid = ttk.Frame(telem_tab)
+        telem_grid.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        frame = ttk.Frame(self.preview_panels_row, relief="groove", borderwidth=2)
-        frame.pack(side="left", padx=(0, 8), pady=(0, 8))
+        self.telem_labels = {}
 
-        ttk.Label(frame, text=port, font=("", 10, "bold")).pack(anchor="w", padx=8, pady=(8, 0))
-        page_label = ttk.Label(frame, text="Page: -", font=("", 9))
-        page_label.pack(anchor="w", padx=8, pady=(0, 5))
+        def make_section(parent, title, row, col, fields):
+            frame = ttk.LabelFrame(parent, text=title)
+            frame.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+            for i, (key, caption) in enumerate(fields):
+                ttk.Label(frame, text=caption + ":").grid(row=i, column=0, sticky="w", padx=6, pady=2)
+                lbl = ttk.Label(frame, text="-")
+                lbl.grid(row=i, column=1, sticky="w", padx=6, pady=2)
+                self.telem_labels[key] = lbl
+            return frame
 
-        canvas_w = int(SCREEN_W * self.PREVIEW_SCALE)
-        canvas_h = int(SCREEN_H * self.PREVIEW_SCALE)
-        canvas = tk.Canvas(frame, width=canvas_w, height=canvas_h,
-                            bg="#000000", highlightthickness=1, highlightbackground="#555")
-        canvas.pack(padx=8, pady=(0, 8))
+        make_section(telem_grid, "Timing", 0, 0, [
+            ("timing.lap", "Lap"), ("timing.position", "Position"),
+            ("timing.last_lap", "Last Lap"), ("timing.best_lap", "Best Lap"),
+            ("timing.delta", "Delta"), ("timing.incidents", "Incidents"),
+            ("timing.sess_laps", "Session Laps Left"),
+        ])
+        make_section(telem_grid, "Fuel", 0, 1, [
+            ("fuel.remaining", "Remaining"), ("fuel.last_burn", "Last Lap Burn"),
+            ("fuel.avg_burn", "Avg Burn"), ("fuel.laps_of_fuel", "Laps of Fuel"),
+            ("fuel.laps_remain", "Laps Remaining"), ("fuel.to_end", "Fuel to Finish"),
+            ("fuel.to_add", "Fuel to Add"),
+        ])
+        make_section(telem_grid, "Car State", 0, 2, [
+            ("car.gear", "Gear"), ("car.speed", "Speed (mph)"),
+            ("car.rpm", "RPM"), ("car.max_rpm", "Redline"),
+            ("car.throttle", "Throttle %"), ("car.brake", "Brake %"),
+        ])
 
-        self.preview_widgets[port] = {"frame": frame, "canvas": canvas, "page_label": page_label}
-        self._draw_preview_for_port(port)
+        tire_frame = ttk.LabelFrame(telem_grid, text="Tires")
+        tire_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        for c, corner in enumerate(["LF", "RF", "LR", "RR"]):
+            ttk.Label(tire_frame, text=corner, font=("", 9, "bold")).grid(row=0, column=c+1, padx=6)
+        for r, (attr, caption) in enumerate([("temp", "Temp"), ("wear", "Wear %"), ("press", "Press")]):
+            ttk.Label(tire_frame, text=caption + ":").grid(row=r+1, column=0, sticky="w", padx=6, pady=2)
+            for c, corner in enumerate(["LF", "RF", "LR", "RR"]):
+                lbl = ttk.Label(tire_frame, text="-")
+                lbl.grid(row=r+1, column=c+1, padx=6, pady=2)
+                self.telem_labels[f"tires.{corner}.{attr}"] = lbl
 
-    def _rebuild_preview_panels(self, ports):
-        # Drop panels for boards that disconnected
-        for port in list(self.preview_widgets.keys()):
-            if port not in ports:
-                self.preview_widgets[port]["frame"].destroy()
-                del self.preview_widgets[port]
-                self.board_previews.pop(port, None)
-        # Add panels for newly-connected boards (existing ones are left
-        # alone so their current page/press state isn't disturbed)
-        for port in ports:
-            if port not in self.preview_widgets:
-                self._add_preview_panel(port)
+        make_section(telem_grid, "Pit Service", 1, 1, [
+            ("pit.fuel", "Fuel Armed"), ("pit.lf", "LF Armed"), ("pit.rf", "RF Armed"),
+            ("pit.lr", "LR Armed"), ("pit.rr", "RR Armed"), ("pit.fr", "Fast Repair"),
+            ("pit.tear", "Tearoff"), ("pit.limiter", "Pit Limiter"),
+        ])
+        make_section(telem_grid, "Adjustments", 1, 2, [
+            ("adj.TC", "TC"), ("adj.BB", "Brake Bias"), ("adj.ABS", "ABS"),
+        ])
 
-    def _draw_all_previews(self):
-        for port in list(self.preview_widgets.keys()):
-            self._draw_preview_for_port(port)
+        rel_frame = ttk.LabelFrame(telem_grid, text="Relative (5 nearest cars)")
+        rel_frame.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=6, pady=6)
+        self.rel_tree = ttk.Treeview(rel_frame, columns=("gap", "car", "name"), show="headings", height=5)
+        self.rel_tree.heading("gap", text="Gap")
+        self.rel_tree.heading("car", text="Car #")
+        self.rel_tree.heading("name", text="Driver")
+        self.rel_tree.column("gap", width=140, anchor="center")
+        self.rel_tree.column("car", width=140, anchor="center")
+        self.rel_tree.column("name", width=350)
+        self.rel_tree.pack(fill="x", padx=6, pady=6)
 
-    def _draw_preview_for_port(self, port):
-        widgets = self.preview_widgets.get(port)
-        if widgets is None:
-            return
-        state = self.board_previews.get(port, {"page": 0, "pressed_code": None})
-        page = state["page"]
-        pressed_code = state["pressed_code"]
+        for c in range(3):
+            telem_grid.columnconfigure(c, weight=1)
 
-        c = widgets["canvas"]
-        c.delete("all")
-        s = self.PREVIEW_SCALE
+    def _update_telemetry_display(self, data):
+        def set_label(key, text):
+            lbl = self.telem_labels.get(key)
+            if lbl is not None:
+                lbl.configure(text=text)
 
-        bg_hex = FLAG_COLORS.get(self.preview_flag, "#333333")
+        timing = data.get("timing", {})
+        set_label("timing.lap", timing.get("lap", "-"))
+        set_label("timing.position", f"P{timing.get('position', '-')} (Class P{timing.get('class_pos', '-')})")
+        set_label("timing.last_lap", timing.get("last_lap", "-"))
+        set_label("timing.best_lap", timing.get("best_lap", "-"))
+        set_label("timing.delta", timing.get("delta", "-"))
+        set_label("timing.incidents", f"{timing.get('incidents', '-')}/{timing.get('inc_limit', '-')}")
+        set_label("timing.sess_laps", timing.get("sess_laps", "-"))
 
-        if self.preview_flag == "CHECKERED":
-            sq = 20
-            cols = int(SCREEN_W * s // sq) + 1
-            rows = int(SCREEN_H * s // sq) + 1
-            for r in range(rows):
-                for col in range(cols):
-                    color = "#ffffff" if (r + col) % 2 == 0 else "#000000"
-                    c.create_rectangle(col * sq, r * sq, (col + 1) * sq, (r + 1) * sq, fill=color, outline="")
-        elif self.preview_flag == "DEBRIS":
-            stripe_w = int(40 * s)
-            cols = int(SCREEN_W * s / stripe_w) + 1
-            for col in range(cols):
-                color = "#f1c40f" if col % 2 == 0 else "#e74c3c"
-                c.create_rectangle(col * stripe_w, 0, (col + 1) * stripe_w, SCREEN_H * s, fill=color, outline="")
-        else:
-            c.create_rectangle(0, 0, SCREEN_W * s, SCREEN_H * s, fill=bg_hex, outline="")
+        fuel = data.get("fuel", {})
+        for key in ["remaining", "last_burn", "avg_burn", "laps_of_fuel", "laps_remain", "to_end", "to_add"]:
+            set_label(f"fuel.{key}", fuel.get(key, "-"))
 
-        # Checkered/debris are busy multi-color patterns - plain
-        # luminance-based text color would disappear into half of it,
-        # so use a distinct accent color for both instead.
-        if self.preview_flag in ("CHECKERED", "DEBRIS"):
-            text_color = "#3498db"
-            outline_color = "#3498db"
-        else:
-            text_color = text_color_for(bg_hex)
-            outline_color = "#aaaaaa"
+        car = data.get("car", {})
+        for key in ["gear", "speed", "rpm", "max_rpm", "throttle", "brake"]:
+            set_label(f"car.{key}", car.get(key, "-"))
 
-        # Slider strip, mirroring the real left-edge slider
-        c.create_rectangle(
-            SLIDER_X * s, 0, (SLIDER_X + SLIDER_W) * s + 6, SCREEN_H * s,
-            fill="", outline="#888888", dash=(3, 2),
-        )
-        handle_y = handle_y_for_page(page)
-        c.create_rectangle(
-            (SLIDER_X + 2) * s, handle_y * s,
-            (SLIDER_X + SLIDER_W - 2) * s, (handle_y + HANDLE_H) * s,
-            fill="#3498db", outline="",
-        )
+        tires = data.get("tires", {})
+        for corner, vals in tires.items():
+            for attr in ["temp", "wear", "press"]:
+                set_label(f"tires.{corner}.{attr}", vals.get(attr, "-"))
 
-        for btn in PAGES_LAYOUT[page]:
-            x, y, w, h = btn["x"] * s, btn["y"] * s, btn["w"] * s, btn["h"] * s
-            pressed = (btn["code"] == pressed_code)
-            fill = "#e67e22" if pressed else btn.get("fill", "")
-            outline = "" if fill else outline_color
+        pit = data.get("pit", {})
+        armed_word = lambda v: "ARMED" if v == "1" else "off"
+        for key in ["fuel", "lf", "rf", "lr", "rr", "fr", "tear"]:
+            set_label(f"pit.{key}", armed_word(pit.get(key, "0")))
+        set_label("pit.limiter", "ON" if pit.get("limiter") == "1" else "off")
 
-            if btn["shape"] == "circle":
-                c.create_oval(x, y, x + w, y + h, fill=fill or btn.get("fill", "#e74c3c"), outline=outline, width=2)
-            else:
-                c.create_rectangle(x, y, x + w, y + h, fill=fill, outline=outline, width=2)
+        adj = data.get("adj", {})
+        for key, val in adj.items():
+            set_label(f"adj.{key}", val)
 
-            icon_name = btn.get("icon")
-            tag = btn.get("tag")
-            label = btn.get("label")
-            label_color = "#ffffff" if fill else text_color
-
-            if icon_name:
-                icon_size = int(min(w, h) * 0.5)
-                photo = self._get_icon_rgba(icon_name, icon_size)
-                icon_cy = (y + h / 2) - (10 * s / 2.4 if tag else 0)  # nudge up a bit if a tag goes below
-                c.create_image(x + w / 2, icon_cy, image=photo)
-                if tag:
-                    c.create_text(
-                        x + w / 2, icon_cy + icon_size / 2 + 12, text=tag, fill=label_color,
-                        font=("", 11, "bold"), justify="center",
-                    )
-            elif label:
-                c.create_text(
-                    x + w / 2, y + h / 2, text=label, fill=label_color,
-                    font=("", 13, "bold"), justify="center",
-                )
-
-        if page == 0:
-            self._draw_outlined_text(c, "BEST LAP", SCREEN_W * s / 2, 95 * s, 12)
-            self._draw_outlined_text(c, self.best_lap_str, SCREEN_W * s / 2, 135 * s, 24)
-
-        page_name = PAGE_NAMES[page] if page < len(PAGE_NAMES) else "?"
-        widgets["page_label"].configure(text=f"Page {page + 1} of {NUM_PAGES}: {page_name}")
-
-    def _get_icon_rgba(self, name, size):
-        """Icon with real alpha transparency, for drawing on the preview Canvas."""
-        key = ("rgba", name, size)
-        if key not in self._icon_cache:
-            img = self._base_icons[name].resize((size, size), Image.LANCZOS)
-            self._icon_cache[key] = ImageTk.PhotoImage(img)
-        return self._icon_cache[key]
+        if "relative" in data:
+            self.rel_tree.delete(*self.rel_tree.get_children())
+            for entry in data["relative"]:
+                gap = float(entry["gap"])
+                gap_str = f"{'+' if gap >= 0 else ''}{gap:.1f}s"
+                self.rel_tree.insert("", "end", values=(gap_str, entry["num"], entry["name"]))
 
     def _get_icon_flat(self, name, size, bg_rgb=(240, 240, 240)):
         """Icon flattened onto a solid background, for widgets (like Label)
@@ -770,13 +1159,12 @@ class App(tk.Tk):
             self._icon_cache[key] = ImageTk.PhotoImage(bg)
         return self._icon_cache[key]
 
-    def _set_fuel_icon(self, pct):
+    def _set_fuel_icon(self):
         photo = self._get_icon_flat("GAS_CAN", 28, bg_rgb=self.dark_bg_rgb)
         self.fuel_icon_label.configure(image=photo, bg="#2b2b2b")
         self.fuel_icon_label.image = photo  # keep a reference so it isn't garbage-collected
 
     def _update_fuel_gauge(self, pct):
-        self.fuel_pct = pct
         if pct is None:
             self.fuel_canvas.coords(self.fuel_bar, 0, 0, 0, 18)
             self.fuel_pct_label.configure(text="no data (iRacing not running)")
@@ -788,6 +1176,89 @@ class App(tk.Tk):
         self.fuel_canvas.itemconfig(self.fuel_bar, fill=color)
         self.fuel_pct_label.configure(text=f"{pct}%")
 
+    def _get_ip_devices_from_tree(self):
+        devices = []
+        for item in self.ip_tree.get_children():
+            name, host, port, enabled, status = self.ip_tree.item(item, "values")
+            devices.append({
+                "name": name, "host": host, "port": int(port),
+                "enabled": (enabled == "Yes"),
+            })
+        return devices
+
+    def _refresh_ip_tree(self):
+        self.ip_tree.delete(*self.ip_tree.get_children())
+        for d in self.backend.ip_devices:
+            status = "connected" if d["connected"] else ("disabled" if not d["enabled"] else "no response")
+            self.ip_tree.insert("", "end", values=(
+                d["name"], d["host"], d["port"], "Yes" if d["enabled"] else "No", status,
+            ))
+
+    def _add_ip_device(self):
+        name = self.ip_name_entry.get().strip()
+        host = self.ip_host_entry.get().strip()
+        port_str = self.ip_port_entry.get().strip()
+        if not name or not host:
+            messagebox.showerror("Invalid", "Name and Host are both required")
+            return
+        try:
+            port = int(port_str)
+        except ValueError:
+            messagebox.showerror("Invalid", "Port must be a number")
+            return
+        devices = self._get_ip_devices_from_tree()
+        devices.append({"name": name, "host": host, "port": port, "enabled": True})
+        self.backend.set_ip_devices(devices)
+        self._refresh_ip_tree()
+        self.ip_name_entry.delete(0, "end")
+        self.ip_host_entry.delete(0, "end")
+
+    def _delete_ip_device(self):
+        sel = self.ip_tree.selection()
+        if not sel:
+            return
+        for item in sel:
+            self.ip_tree.delete(item)
+        self.backend.set_ip_devices(self._get_ip_devices_from_tree())
+
+    def _edit_ip_device_cell(self, event):
+        item = self.ip_tree.identify_row(event.y)
+        col = self.ip_tree.identify_column(event.x)
+        if not item:
+            return
+        if col == "#4":  # Enabled column - just toggle it directly
+            current = self.ip_tree.set(item, "enabled")
+            self.ip_tree.set(item, "enabled", "No" if current == "Yes" else "Yes")
+            self.backend.set_ip_devices(self._get_ip_devices_from_tree())
+            return
+        if col not in ("#1", "#2", "#3"):
+            return  # status column isn't editable
+        bbox = self.ip_tree.bbox(item, col)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        col_key = {"#1": "name", "#2": "host", "#3": "port"}[col]
+        current_val = self.ip_tree.set(item, col_key)
+        entry = ttk.Entry(self.ip_tree)
+        entry.insert(0, current_val)
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus()
+
+        def save_edit(evt=None):
+            new_val = entry.get().strip()
+            if col_key == "port":
+                try:
+                    new_val = int(new_val)
+                except ValueError:
+                    entry.destroy()
+                    return
+            self.ip_tree.set(item, col_key, new_val)
+            entry.destroy()
+            self.backend.set_ip_devices(self._get_ip_devices_from_tree())
+
+        entry.bind("<Return>", save_edit)
+        entry.bind("<FocusOut>", save_edit)
+
     def _send_manual_command(self):
         cmd = self.command_entry.get().strip()
         if not cmd:
@@ -796,9 +1267,26 @@ class App(tk.Tk):
         self._append_log(f"[manual] Sent: {cmd}")
         self.command_entry.delete(0, "end")
 
+    def _mapping_device_options(self):
+        opts = ["Default (fallback for all devices)"]
+        seen = set()
+        for name in self.serial_ports + self.connected_ip_names + list(self.mapping.keys()):
+            if name == DEFAULT_DEVICE_KEY or name in seen:
+                continue
+            seen.add(name)
+            opts.append(name)
+        return opts
+
+    def _current_mapping_device_key(self):
+        sel = self.mapping_device_var.get().strip()
+        if not sel or sel.startswith("Default"):
+            return DEFAULT_DEVICE_KEY
+        return sel
+
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
-        for code, btn in sorted(self.mapping.items(), key=lambda kv: kv[1]):
+        device_map = self.mapping.get(self._current_mapping_device_key(), {})
+        for code, btn in sorted(device_map.items(), key=lambda kv: kv[1]):
             self.tree.insert("", "end", iid=code, values=(code, btn))
 
     def _edit_mapping_cell(self, event):
@@ -824,8 +1312,9 @@ class App(tk.Tk):
                 entry.destroy()
                 return
             self.tree.set(item, "button", new_val_int)
+            device_key = self._current_mapping_device_key()
             with self.mapping_lock:
-                self.mapping[item] = new_val_int
+                self.mapping.setdefault(device_key, {})[item] = new_val_int
             entry.destroy()
 
         entry.bind("<Return>", save_edit)
@@ -841,8 +1330,10 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror("Invalid", "Button # must be a number")
             return
+        device_key = self._current_mapping_device_key()
         with self.mapping_lock:
-            self.mapping[code] = btn
+            self.mapping.setdefault(device_key, {})[code] = btn
+        self.mapping_device_combo.configure(values=self._mapping_device_options())
         self._refresh_tree()
         self.new_code_entry.delete(0, "end")
         self.new_button_entry.delete(0, "end")
@@ -851,9 +1342,10 @@ class App(tk.Tk):
         sel = self.tree.selection()
         if not sel:
             return
+        device_key = self._current_mapping_device_key()
         for code in sel:
             with self.mapping_lock:
-                self.mapping.pop(code, None)
+                self.mapping.get(device_key, {}).pop(code, None)
         self._refresh_tree()
 
     def _save_mappings(self):
@@ -863,8 +1355,8 @@ class App(tk.Tk):
 
     def _append_log(self, msg):
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
+        self.log_text.insert("1.0", msg + "\n")
+        self.log_text.see("1.0")
         self.log_text.configure(state="disabled")
 
     def _poll_queue(self):
@@ -882,35 +1374,27 @@ class App(tk.Tk):
                     )
                 elif kind == "boards":
                     ports = item[1]
+                    self.serial_ports = ports
                     self.boards_label.configure(text=", ".join(ports) if ports else "none yet")
-                    self._rebuild_preview_panels(ports)
+                    self.mapping_device_combo.configure(values=self._mapping_device_options())
+                elif kind == "ip_devices_status":
+                    self._refresh_ip_tree()
+                    self.connected_ip_names = [name for name, connected in item[1] if connected]
+                    self.mapping_device_combo.configure(values=self._mapping_device_options())
                 elif kind == "flag":
                     flag = item[1]
                     self.flag_swatch.itemconfig(self.flag_rect, fill=FLAG_COLORS.get(flag, "#333333"))
                     self.flag_text.configure(text=flag)
-                    self.preview_flag = flag
-                    self._draw_all_previews()
-                elif kind == "page":
-                    port, page_num = item[1], item[2]
-                    if port in self.board_previews:
-                        self.board_previews[port]["page"] = page_num
-                        self._draw_preview_for_port(port)
                 elif kind == "fuel":
                     self._update_fuel_gauge(item[1])
-                elif kind == "laptime":
-                    self.best_lap_str = format_lap_time(item[1])
-                    self._draw_all_previews()
+                elif kind == "telemetry":
+                    self.latest_telemetry = item[1]
+                    self._update_telemetry_display(item[1])
                 elif kind in ("press", "release"):
                     port, code, btn = item[1], item[2], item[3]
                     verb = "PRESS" if kind == "press" else "RELEASE"
                     self.last_button_label.configure(text=f"{verb} {code}  (vJoy #{btn})  [{port}]")
                     self._append_log(f"({port}) {verb} {code} -> vJoy button {btn}")
-                    if port in self.board_previews:
-                        state = self.board_previews[port]
-                        state["pressed_code"] = code if kind == "press" else (
-                            None if state["pressed_code"] == code else state["pressed_code"]
-                        )
-                        self._draw_preview_for_port(port)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
@@ -946,7 +1430,7 @@ class App(tk.Tk):
         # stuck "held down" if you quit mid-press.
         if self.backend.j is not None:
             with self.mapping_lock:
-                button_nums = list(self.mapping.values())
+                button_nums = {btn for device_map in self.mapping.values() for btn in device_map.values()}
             for btn in button_nums:
                 try:
                     self.backend.j.set_button(btn, 0)
