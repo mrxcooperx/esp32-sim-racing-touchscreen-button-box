@@ -1,5 +1,3 @@
-[Readmeesp32.txt](https://github.com/user-attachments/files/31941009/Readmeesp32.txt)
-
 <img width="1367" height="1140" alt="image" src="https://github.com/user-attachments/assets/dbb5297b-ba71-490c-a08e-c12cb66f2878" />
 
 
